@@ -1,0 +1,6 @@
+services:
+  prax:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./data:/data

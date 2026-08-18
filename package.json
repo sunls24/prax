@@ -1,0 +1,32 @@
+{
+  "name": "prax",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A minimal containerized AI agent reachable from messaging channels.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "config": "tsx src/main.ts config",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@mozilla/readability": "0.6.0",
+    "grammy": "1.45.1",
+    "linkedom": "0.18.13",
+    "pino": "10.3.1",
+    "typebox": "1.3.15"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

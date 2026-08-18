@@ -1,0 +1,13 @@
+{
+  "dataDir": ".",
+  "agent": {
+    "provider": "custom-api",
+    "model": "your-model"
+  },
+  "telegram": {
+    "allowedUserIds": ["123456789"]
+  },
+  "webSearch": {
+    "enabled": false
+  }
+}

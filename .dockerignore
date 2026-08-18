@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.secrets
+config.json
+data
+dist
+node_modules
+coverage
+*.log
+.DS_Store
