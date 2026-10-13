@@ -1,10 +1,36 @@
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
-import { configPath as defaultConfigPath } from "./paths.js";
+import { dirname, resolve } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export interface AppConfig {
+export interface ConfigInput {
+  dataDir?: string;
+  agent: {
+    provider: string;
+    model: string;
+    thinkingLevel?: ThinkingLevel;
+    timeoutSeconds?: number;
+  };
+  telegram: {
+    accountId?: string;
+    allowedUserIds: string[];
+  };
+  webSearch?: {
+    enabled: boolean;
+    maxResults?: number;
+    timeoutSeconds?: number;
+  };
+  webFetch?: {
+    enabled: boolean;
+    timeoutSeconds?: number;
+    maxResponseBytes?: number;
+    maxTextChars?: number;
+    maxRedirects?: number;
+  };
+}
+
+export interface AppPaths {
   configPath: string;
   dataDir: string;
   workspaceDir: string;
@@ -12,129 +38,104 @@ export interface AppConfig {
   stateDir: string;
   agentDir: string;
   modelsPath: string;
-  agent: {
-    provider: string;
-    model: string;
-    thinkingLevel: ThinkingLevel;
-    timeoutSeconds: number;
-  };
-  telegram: {
-    accountId: string;
-    allowedUserIds: string[];
-  };
-  webSearch: {
-    enabled: boolean;
-    provider: "tavily";
-    maxResults: number;
-    timeoutSeconds: number;
-  };
-  webFetch: {
-    enabled: boolean;
-    timeoutSeconds: number;
-    maxResponseBytes: number;
-    maxTextChars: number;
-    maxRedirects: number;
-  };
+  secretsDir: string;
 }
 
-type JsonObject = Record<string, unknown>;
+export type AppConfig = AppPaths & {
+  agent: Required<ConfigInput["agent"]>;
+  telegram: Required<ConfigInput["telegram"]>;
+  webSearch: Required<NonNullable<ConfigInput["webSearch"]>>;
+  webFetch: Required<NonNullable<ConfigInput["webFetch"]>>;
+};
 
-function asObject(value: unknown, path: string): JsonObject {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${path} must be an object`);
-  }
-  return value as JsonObject;
+export function configPath(): string {
+  return resolve(process.env.PRAX_CONFIG ?? resolve(process.env.PRAX_DATA_DIR ?? "./data", "config.json"));
 }
 
-function stringValue(object: JsonObject, key: string, fallback?: string): string {
-  const value = object[key] ?? fallback;
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${key} must be a non-empty string`);
-  }
-  return value;
-}
-
-function numberValue(object: JsonObject, key: string, fallback: number, min: number, max: number): number {
-  const value = object[key] ?? fallback;
-  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
-    throw new Error(`${key} must be a number between ${min} and ${max}`);
-  }
-  return value;
-}
-
-function booleanValue(object: JsonObject, key: string, fallback: boolean): boolean {
-  const value = object[key] ?? fallback;
-  if (typeof value !== "boolean") {
-    throw new Error(`${key} must be a boolean`);
-  }
-  return value;
-}
-
-function resolveFrom(baseDir: string, value: string): string {
-  return isAbsolute(value) ? value : resolve(baseDir, value);
-}
-
-export async function loadConfig(configPath = defaultConfigPath()): Promise<AppConfig> {
-  const absoluteConfigPath = resolve(configPath);
-  const configDir = resolve(absoluteConfigPath, "..");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(absoluteConfigPath, "utf8"));
-  } catch (error) {
-    throw new Error(`Unable to load config at ${absoluteConfigPath}`, { cause: error });
-  }
-
-  const root = asObject(parsed, "config");
-  const agent = asObject(root.agent, "agent");
-  const telegram = asObject(root.telegram, "telegram");
-  const webSearch = asObject(root.webSearch ?? {}, "webSearch");
-  const webFetch = asObject(root.webFetch ?? {}, "webFetch");
-  const dataDir = resolveFrom(configDir, stringValue(root, "dataDir", "./data"));
-  const thinkingLevel = stringValue(agent, "thinkingLevel", "medium") as ThinkingLevel;
-  if (!new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).has(thinkingLevel)) {
-    throw new Error("agent.thinkingLevel is invalid");
-  }
-
-  const allowedUserIds = telegram.allowedUserIds;
-  if (!Array.isArray(allowedUserIds) || allowedUserIds.length === 0 || allowedUserIds.some((id) => typeof id !== "string")) {
-    throw new Error("telegram.allowedUserIds must be a non-empty string array");
-  }
-
-  const provider = stringValue(webSearch, "provider", "tavily");
-  if (provider !== "tavily") {
-    throw new Error(`Unsupported webSearch.provider: ${provider}`);
-  }
-
+export function resolvePaths(path: string, dataDir?: string): AppPaths {
+  const absoluteConfigPath = resolve(path);
+  const resolvedDataDir = process.env.PRAX_DATA_DIR
+    ? resolve(process.env.PRAX_DATA_DIR)
+    : resolve(dirname(absoluteConfigPath), dataDir ?? ".");
   return {
     configPath: absoluteConfigPath,
-    dataDir,
-    workspaceDir: resolve(dataDir, "workspace"),
-    sessionsDir: resolve(dataDir, "sessions"),
-    stateDir: resolve(dataDir, "state"),
-    agentDir: resolve(dataDir, "pi-agent"),
-    modelsPath: resolve(dataDir, "models.json"),
+    dataDir: resolvedDataDir,
+    workspaceDir: resolve(resolvedDataDir, "workspace"),
+    sessionsDir: resolve(resolvedDataDir, "sessions"),
+    stateDir: resolve(resolvedDataDir, "state"),
+    agentDir: resolve(resolvedDataDir, "pi-agent"),
+    modelsPath: resolve(resolvedDataDir, "models.json"),
+    secretsDir: resolve(resolvedDataDir, "secrets"),
+  };
+}
+
+export function parseConfig(input: ConfigInput, path: string): AppConfig {
+  if (!input?.agent?.provider || !input.agent.model) {
+    throw new Error("Missing required fields: agent.provider and agent.model");
+  }
+  if (!input.telegram?.allowedUserIds?.length) {
+    throw new Error("Missing required field: telegram.allowedUserIds");
+  }
+  const webSearch = input.webSearch ?? { enabled: false };
+  const webFetch = input.webFetch ?? { enabled: true };
+
+  return {
+    ...resolvePaths(path, input.dataDir),
     agent: {
-      provider: stringValue(agent, "provider"),
-      model: stringValue(agent, "model"),
-      thinkingLevel,
-      timeoutSeconds: numberValue(agent, "timeoutSeconds", 300, 10, 3600),
+      provider: input.agent.provider,
+      model: input.agent.model,
+      thinkingLevel: input.agent.thinkingLevel ?? "medium",
+      timeoutSeconds: input.agent.timeoutSeconds ?? 300,
     },
     telegram: {
-      accountId: stringValue(telegram, "accountId", "default"),
-      allowedUserIds,
+      accountId: input.telegram.accountId ?? "default",
+      allowedUserIds: input.telegram.allowedUserIds,
     },
     webSearch: {
-      enabled: booleanValue(webSearch, "enabled", true),
-      provider,
-      maxResults: numberValue(webSearch, "maxResults", 5, 1, 10),
-      timeoutSeconds: numberValue(webSearch, "timeoutSeconds", 15, 1, 60),
+      enabled: webSearch.enabled,
+      maxResults: webSearch.maxResults ?? 5,
+      timeoutSeconds: webSearch.timeoutSeconds ?? 15,
     },
     webFetch: {
-      enabled: booleanValue(webFetch, "enabled", true),
-      timeoutSeconds: numberValue(webFetch, "timeoutSeconds", 15, 1, 60),
-      maxResponseBytes: numberValue(webFetch, "maxResponseBytes", 2 * 1024 * 1024, 1024, 10 * 1024 * 1024),
-      maxTextChars: numberValue(webFetch, "maxTextChars", 50_000, 1000, 200_000),
-      maxRedirects: numberValue(webFetch, "maxRedirects", 3, 0, 10),
+      enabled: webFetch.enabled,
+      timeoutSeconds: webFetch.timeoutSeconds ?? 15,
+      maxResponseBytes: webFetch.maxResponseBytes ?? 2 * 1024 * 1024,
+      maxTextChars: webFetch.maxTextChars ?? 50_000,
+      maxRedirects: webFetch.maxRedirects ?? 3,
     },
   };
+}
+
+export async function loadConfig(path = configPath()): Promise<AppConfig> {
+  const input = await readJsonFile(path);
+  if (input === undefined) {
+    throw new Error(`Config not found at ${resolve(path)}. Run the config command first.`);
+  }
+  return parseConfig(input as ConfigInput, path);
+}
+
+export async function readJsonFile(path: string): Promise<unknown> {
+  try {
+    const content = await readFile(path, "utf8");
+    return JSON.parse(content);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`Unable to load JSON from ${path}`, { cause: error });
+    }
+    throw error;
+  }
+}
+
+export async function createModelRuntime(paths: AppPaths): Promise<ModelRuntime> {
+  const runtime = await ModelRuntime.create({
+    authPath: resolve(paths.agentDir, "auth.json"),
+    modelsPath: paths.modelsPath,
+    refreshOnCreate: false,
+  });
+  const error = runtime.getError();
+  if (error) throw new Error(error);
+  return runtime;
 }

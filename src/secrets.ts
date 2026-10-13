@@ -1,6 +1,12 @@
 import { readFile } from "node:fs/promises";
 
-export async function readSecret(name: string, required = true, defaultFilePath?: string): Promise<string | undefined> {
+export function redactTelegramToken(text: string): string {
+  return text.replace(/\/bot\d+:[A-Za-z0-9_-]+/g, "/bot[REDACTED]");
+}
+
+export function readSecret(name: string, required: true, defaultFilePath?: string): Promise<string>;
+export function readSecret(name: string, required: false, defaultFilePath?: string): Promise<string | undefined>;
+export async function readSecret(name: string, required: boolean, defaultFilePath?: string): Promise<string | undefined> {
   const filePath = process.env[`${name}_FILE`];
   const directValue = process.env[name];
   let value = directValue;

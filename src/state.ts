@@ -16,7 +16,6 @@ export class StateStore {
         account_id TEXT NOT NULL,
         peer_id TEXT NOT NULL,
         message_id TEXT NOT NULL,
-        processed_at INTEGER NOT NULL,
         PRIMARY KEY (channel, account_id, peer_id, message_id)
       );
     `);
@@ -24,9 +23,9 @@ export class StateStore {
 
   claimMessage(channel: string, accountId: string, peerId: string, messageId: string): boolean {
     const result = this.database.prepare(`
-      INSERT OR IGNORE INTO processed_messages (channel, account_id, peer_id, message_id, processed_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(channel, accountId, peerId, messageId, Date.now());
+      INSERT OR IGNORE INTO processed_messages (channel, account_id, peer_id, message_id)
+      VALUES (?, ?, ?, ?)
+    `).run(channel, accountId, peerId, messageId);
     return result.changes > 0;
   }
 

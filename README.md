@@ -1,132 +1,51 @@
 # Prax
 
-Prax is a minimal personal AI agent that receives tasks from Telegram and works inside one persistent container. It can read and edit workspace files, run shell commands, search with Tavily, and fetch public web pages.
+个人 Telegram AI 助理，支持文件操作、命令执行和联网检索。一个 bot 共用一份工作区和一个活跃会话，仅处理白名单用户的私聊文本。
 
-This first version intentionally supports one Telegram bot, one owner allowlist, one workspace, and one active session. The channel boundary keeps account, peer, message, and reply context separate so an official WeChat ClawBot adapter can be added later without changing the agent runtime.
+## 启动
 
-## Requirements
-
-- Node.js 24+ for local development, or Docker
-- A Telegram bot token from BotFather
-- A model API key supported by Pi
-- A Tavily API key when web search is enabled
-
-## Configuration
-
-Prax uses an interactive configuration command. The required items are:
-
-- Custom API base URL
-- API protocol: OpenAI Responses or Chat Completions
-- Model ID
-- API key
-- Telegram bot token
-- Telegram owner numeric user ID
-
-Tavily search is optional. All timeout, storage, thinking, fetch, and queue settings use built-in defaults.
-
-For Docker, configuration and runtime data are stored under the visible local `./data` directory:
+准备 Telegram bot token、数字用户 ID 和模型 API key。配置命令支持 OpenAI Responses / Chat Completions 兼容接口；启用搜索时还需要 Tavily key。
 
 ```bash
 mkdir -p data
 docker compose build
+docker compose run --rm --user root --entrypoint sh prax -c 'chown -R node:node /data'
 docker compose run --rm prax config
 docker compose up -d
 ```
 
-Run the same command later to update existing values. Empty secret input keeps the existing secret.
+Compose 以 `node` 用户运行，首次配置前需用上述 `chown` 命令设置数据目录权限。
 
-Generated files include:
-
-```text
-data/
-├── config.json
-├── models.json
-├── secrets/
-├── workspace/
-├── sessions/
-├── state/
-└── pi-agent/
-```
-
-## Local setup
+本地运行需要 Node.js 24+：
 
 ```bash
 npm install --ignore-scripts
 npm run config
-```
-
-Start Prax:
-
-```bash
 npm run dev
 ```
 
-The default local data directory is `./data`. Prax creates:
+再次运行配置命令即可修改设置；已有密钥留空保留，模型参数和思考强度可在向导中调整。修改后运行 `docker compose restart prax`，本地运行则重启进程。
 
-```text
-data/
-├── pi-agent/
-├── sessions/
-├── state/gateway.sqlite
-└── workspace/
-```
+配置、密钥、工作区和会话默认保存在 `./data`（Compose 中为 `/data`）。`PRAX_DATA_DIR` 设置数据目录，`PRAX_CONFIG` 指定配置文件。
 
-Use `docker compose logs -f prax` to follow the Docker service logs.
+## 使用
 
-## Container images
+- `/status`：查看模型、会话和运行状态。
+- `/stop`：停止当前任务，排队任务随后继续。
+- `/new`：空闲时清空历史并新建会话，旧对话不可恢复，保留工作区文件。
 
-GitHub Actions builds `linux/amd64` and `linux/arm64` images for every branch push. Branch builds are published to GitHub Container Registry with the branch name and commit SHA, for example:
+`/start` 与 `/status` 效果相同。
 
-```text
-ghcr.io/OWNER/prax:main
-ghcr.io/OWNER/prax:sha-92caa77
-```
+消息按顺序处理，回复支持 Markdown，必要时回退纯文本。默认任务超时 300 秒，搜索关闭，网页抓取开启。
 
-Pull requests build both architectures for validation without publishing. Tags beginning with `v` publish version tags and `latest`:
+正常重启恢复当前对话；`/new` 后即使没有新消息，重启也保持空白。
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-docker pull ghcr.io/OWNER/prax:0.1.0
-```
-
-The package is private when the repository or GHCR package visibility is private. Configure the package as public in GitHub when anonymous pulls are required.
-
-## Telegram commands
-
-- `/status` shows the current model, session, workspace, and queue state.
-- `/stop` aborts the running task.
-- `/new` starts a fresh conversation while preserving workspace files.
-
-Normal text messages are queued and executed sequentially. Prax sends an acknowledgement first, then the final result. Long responses are split to fit Telegram limits.
-
-Message handling is intentionally at-most-once in this first version. SQLite prevents duplicate Telegram updates, but queued or running tasks may be lost if the process exits, and Telegram delivery failures may lose an acknowledgement or final response. Prax does not automatically replay agent tasks because file edits and commands may have side effects; resend the task after a restart when needed. A failed acknowledgement does not prevent the task from running.
-
-## Configuration
-
-The interactive command writes settings under `data/`. Environment variables remain available as advanced overrides:
-
-| Secret | Direct variable | File variable |
-|---|---|---|
-| Model API key | `PRAX_MODEL_API_KEY` | `PRAX_MODEL_API_KEY_FILE` |
-| Telegram token | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_BOT_TOKEN_FILE` |
-| Tavily key | `TAVILY_API_KEY` | `TAVILY_API_KEY_FILE` |
-
-Pi's bash tool is replaced with a Prax-controlled definition that passes only a small environment allowlist to child commands. Model, Telegram, and Tavily credentials are not inherited by shell commands. This reduces accidental exposure but is not a hard security boundary when the gateway and tool process share the same Unix user.
-
-## Current boundaries
-
-- Text messages only
-- One Telegram account and owner allowlist
-- One shared workspace and active conversation
-- No attachments, browser automation, cron, MCP, subagents, or long-term memory
-- Web fetch supports public HTML, plain text, and JSON; private networks and local URLs are rejected
-- The container must not mount the Docker socket, host home directory, or other sensitive paths
-
-## Development
+## 开发
 
 ```bash
 npm run check
 npm test
 npm run build
 ```
+
+日志：`docker compose logs -f prax`。
