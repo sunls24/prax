@@ -71,7 +71,7 @@ async function run(): Promise<void> {
           {
             configPath: config.configPath,
             workspaceDir: config.workspaceDir,
-            sessionId: agent.status().sessionId,
+            version: agent.status().version,
           },
           "Prax started",
         );

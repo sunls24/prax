@@ -87,9 +87,9 @@ export class TelegramBot {
     try {
       await this.bot.init(signal);
       await this.bot.api.setMyCommands([
-        { command: "new", description: "清空会话历史" },
+        { command: "status", description: "查看版本和运行状态" },
         { command: "stop", description: "停止当前任务" },
-        { command: "status", description: "查看当前状态" },
+        { command: "new", description: "清空会话（不可恢复）" },
       ], {}, signal);
       if (signal.aborted) return;
 
@@ -111,26 +111,28 @@ export class TelegramBot {
     const command = commandName(text);
     if (command === "stop") {
       const stopped = await this.agent.stop();
-      await this.reply(peerId, replyId, stopped ? "已发送停止请求" : "当前没有运行中的任务");
+      await this.reply(peerId, replyId, stopped ? "✓ 任务已停止\n排队任务将继续执行" : "当前无运行中的任务");
       return;
     }
     if (command === "status" || command === "start") {
       const status = this.agent.status();
+      const pendingInfo = this.pending > 0 ? ` (${this.pending} 个任务排队)` : "";
       await this.reply(peerId, replyId, [
-        `状态：${status.running ? "运行中" : "空闲"}`,
+        `Prax v${status.version}`,
+        "━━━━━━━━━━━━━━━━━━",
         `模型：${status.provider}/${status.model}`,
-        `会话：${status.sessionId}`,
-        `工作区：${status.workspaceDir}`,
+        `状态：${status.running ? "运行中" : "空闲"}${pendingInfo}`,
+        `会话：${status.hasHistory ? "已保留历史" : "新会话"}`,
       ].join("\n"));
       return;
     }
     if (command === "new") {
       if (this.pending > 0) {
-        await this.reply(peerId, replyId, "当前还有任务，请稍后再新建会话");
+        await this.reply(peerId, replyId, `⚠️ 当前有 ${this.pending} 个任务排队\n等待完成后再清空会话，或使用 /stop 停止任务`);
         return;
       }
       await this.agent.reset();
-      await this.reply(peerId, replyId, "已清空会话历史，工作区文件保持不变");
+      await this.reply(peerId, replyId, `✓ 会话已清空\n历史对话不可恢复，工作区文件保留`);
       return;
     }
     if (command) {

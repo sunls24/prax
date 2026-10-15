@@ -86,18 +86,18 @@ describe("PraxAgent with the Pi SDK", () => {
     expect(requests[0]?.tools.map((tool) => tool.function.name).sort()).toEqual(["bash", "edit", "read", "web_fetch", "write"]);
     expect(await readFile(join(config.workspaceDir, "note.txt"), "utf8")).toBe("hello");
     expect(requests[1]?.messages.some((message) => message.role === "tool")).toBe(true);
-    const sessionId = agent.status().sessionId;
+    const hasHistory = agent.status().hasHistory;
     await agent.dispose();
 
     const restored = await createAgent();
-    expect(restored.status().sessionId).toBe(sessionId);
+    expect(restored.status().hasHistory).toBe(hasHistory);
     expect(await restored.prompt("continue the conversation")).toBe("done");
     expect(JSON.stringify(requests[2]?.messages)).toContain("write a note");
     const [currentFile] = await readdir(config.sessionsDir);
     await writeFile(join(config.sessionsDir, "older-session.jsonl"), await readFile(join(config.sessionsDir, currentFile!)));
     await writeFile(join(config.sessionsDir, "keep.txt"), "not a session");
     await restored.reset();
-    expect(restored.status().sessionId).not.toBe(sessionId);
+    expect(restored.status().hasHistory).toBe(false);
     expect(await readdir(config.sessionsDir)).toEqual(["keep.txt"]);
     await restored.dispose();
 
@@ -117,13 +117,13 @@ describe("PraxAgent with the Pi SDK", () => {
     const history = await readFile(join(config.sessionsDir, currentFile!), "utf8");
     const olderFile = join(config.sessionsDir, "older-session.jsonl");
     await writeFile(olderFile, history);
-    const sessionId = agent.status().sessionId;
+    const hadHistory = agent.status().hasHistory;
     const filesystem = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
     const error = Object.assign(new Error("cannot delete old history"), { code: "EACCES" });
     vi.mocked(unlink).mockImplementationOnce((path) => path === olderFile ? Promise.reject(error) : filesystem.unlink(path));
 
     await expect(agent.reset()).rejects.toBe(error);
-    expect(agent.status().sessionId).toBe(sessionId);
+    expect(agent.status().hasHistory).toBe(hadHistory);
     expect(await readFile(join(config.sessionsDir, currentFile!), "utf8")).toBe(history);
     await agent.prompt("continue after failed reset");
     expect(JSON.stringify(requests[1]?.messages)).toContain("old conversation");

@@ -44,11 +44,11 @@ export class AgentStoppedError extends Error {
 }
 
 export interface PraxAgentStatus {
+  version: string;
   running: boolean;
   provider: string;
   model: string;
-  sessionId: string;
-  workspaceDir: string;
+  hasHistory: boolean;
 }
 
 type AssistantMessage = Extract<MessageEndEvent["message"], { role: "assistant" }>;
@@ -193,11 +193,11 @@ export class PraxAgent {
 
   status(): PraxAgentStatus {
     return {
+      version: "0.1.0",
       running: this.running,
       provider: this.session.model!.provider,
       model: this.session.model!.id,
-      sessionId: this.session.sessionId,
-      workspaceDir: this.config.workspaceDir,
+      hasHistory: this.session.messages.length > 0,
     };
   }
 
