@@ -65,10 +65,6 @@ function output(): string {
   return terminal.write.mock.calls.map(([chunk]) => String(chunk)).join("");
 }
 
-function cancelled(): Error {
-  return Object.assign(new Error("User force closed the prompt"), { name: "ExitPromptError" });
-}
-
 async function existingConfiguration() {
   const settings = {
     dataDir: "runtime",

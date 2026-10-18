@@ -53,16 +53,28 @@ export interface PraxAgentStatus {
 
 type AssistantMessage = Extract<MessageEndEvent["message"], { role: "assistant" }>;
 
+interface SessionContext {
+  session: AgentSession | null;
+  running: boolean;
+  abortReason?: AgentStoppedError | AgentTimeoutError;
+}
+
 export class PraxAgent {
-  private running = false;
-  private abortReason: AgentStoppedError | AgentTimeoutError | undefined;
+  private sessions = new Map<string, SessionContext>();
+  private resourceLoader: DefaultResourceLoader;
+  private settingsManager: SettingsManager;
 
   private constructor(
     private readonly config: AppConfig,
-    private session: AgentSession,
-    private readonly openSession: (manager: SessionManager) => Promise<AgentSession>,
+    resourceLoader: DefaultResourceLoader,
+    settingsManager: SettingsManager,
+    private readonly modelRuntime: any,
+    private readonly customTools: ToolDefinition<any, any>[],
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.resourceLoader = resourceLoader;
+    this.settingsManager = settingsManager;
+  }
 
   static async create(options: {
     config: AppConfig;
@@ -85,10 +97,9 @@ export class PraxAgent {
       throw new Error(`Unknown model ${config.agent.provider}/${config.agent.model}. Available: ${available || "none"}`);
     }
 
-    const safeEnv = createSafeCommandEnv(config.workspaceDir);
     const customTools: ToolDefinition<any, any>[] = [createBashToolDefinition(config.workspaceDir, {
       exposeSessionEnvironment: false,
-      spawnHook: ({ command, cwd }) => ({ command, cwd, env: { ...safeEnv } }),
+      spawnHook: ({ command, cwd }) => ({ command, cwd, env: createSafeCommandEnv(cwd) }),
     })];
 
     if (searchProvider) customTools.push(createWebSearchTool(config, searchProvider));
@@ -104,105 +115,180 @@ export class PraxAgent {
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
-      // Keep Pi's built-in prompt even when a SYSTEM.md file is present.
       systemPromptOverride: () => undefined,
       appendSystemPrompt: [PRAX_INSTRUCTIONS],
     });
     await resourceLoader.reload();
 
-    const openSession = async (sessionManager: SessionManager): Promise<AgentSession> => {
-      const { session } = await createAgentSession({
-        cwd: config.workspaceDir,
-        agentDir: config.agentDir,
-        modelRuntime,
-        model,
-        thinkingLevel: config.agent.thinkingLevel,
-        customTools,
-        resourceLoader,
-        settingsManager,
-        sessionManager,
-      });
-      return session;
-    };
-    const session = await openSession(SessionManager.continueRecent(config.workspaceDir, config.sessionsDir));
-    return new PraxAgent(config, session, openSession, logger);
+    return new PraxAgent(config, resourceLoader, settingsManager, modelRuntime, customTools, logger);
   }
 
-  async prompt(text: string): Promise<string> {
-    if (this.running) throw new Error("Agent is already running");
-    this.running = true;
-    this.abortReason = undefined;
+  private getSessionKey(channel: string, sessionId: string): string {
+    // 防止路径注入
+    const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, "");
+    const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "");
+    if (!safeChannel || !safeSessionId) {
+      throw new Error("Invalid channel or sessionId");
+    }
+    return `${safeChannel}:${safeSessionId}`;
+  }
 
-    let lastAssistantMessage: AssistantMessage | undefined;
-    const unsubscribe = this.session.subscribe((event) => {
-      // Pi's preflight may still be pending when stop() is called.
-      if (event.type === "agent_start" && this.abortReason) void this.session.abort();
-      if (event.type === "message_end" && event.message.role === "assistant") {
-        lastAssistantMessage = event.message;
-      }
+  getWorkspacePath(channel: string, sessionId: string): string {
+    return join(this.config.dataDir, "workspace", this.getSessionKey(channel, sessionId).replace(":", "-"));
+  }
+
+  private getSessionsPath(channel: string, sessionId: string): string {
+    return join(this.config.sessionsDir, this.getSessionKey(channel, sessionId).replace(":", "-"));
+  }
+
+  private async createSession(sessionManager: SessionManager): Promise<AgentSession> {
+    const workspaceDir = sessionManager.getCwd();
+    await mkdir(workspaceDir, { recursive: true });
+
+    const model = this.modelRuntime.getModel(this.config.agent.provider, this.config.agent.model)!;
+    const { session } = await createAgentSession({
+      cwd: workspaceDir,
+      agentDir: this.config.agentDir,
+      modelRuntime: this.modelRuntime,
+      model,
+      thinkingLevel: this.config.agent.thinkingLevel,
+      customTools: this.customTools,
+      resourceLoader: this.resourceLoader,
+      settingsManager: this.settingsManager,
+      sessionManager,
     });
+    return session;
+  }
 
-    const timeout = setTimeout(() => {
-      this.abortReason ??= new AgentTimeoutError(this.config.agent.timeoutSeconds);
-      void this.session.abort();
-    }, this.config.agent.timeoutSeconds * 1000);
+  async prompt(channel: string, sessionId: string, text: string): Promise<string> {
+    const key = this.getSessionKey(channel, sessionId);
+
+    // 确保 session context 存在，但暂不创建 session
+    if (!this.sessions.has(key)) {
+      this.sessions.set(key, { session: null, running: false });
+    }
+    const ctx = this.sessions.get(key)!;
+
+    if (ctx.running) throw new Error("Agent is already running");
+    ctx.running = true;
+    delete ctx.abortReason;
 
     try {
-      await this.session.prompt(text, { expandPromptTemplates: false });
-      if (this.abortReason) throw this.abortReason;
-      if (!lastAssistantMessage) throw new Error("Agent completed without an assistant response");
-      if (lastAssistantMessage.stopReason === "aborted") throw new AgentStoppedError();
-      if (lastAssistantMessage.stopReason === "error") throw new Error(lastAssistantMessage.errorMessage ?? "Model request failed");
-      return this.session.getLastAssistantText() ?? "处理已结束，未返回文字回复";
+      // 延迟创建 session，但在 running = true 之后
+      if (!ctx.session) {
+        const workspaceDir = this.getWorkspacePath(channel, sessionId);
+        const sessionsDir = this.getSessionsPath(channel, sessionId);
+        ctx.session = await this.createSession(SessionManager.continueRecent(workspaceDir, sessionsDir));
+      }
+
+      const session = ctx.session;
+      let lastAssistantMessage: AssistantMessage | undefined;
+      const unsubscribe = session.subscribe((event) => {
+        if (event.type === "agent_start" && ctx.abortReason) void session.abort();
+        if (event.type === "message_end" && event.message.role === "assistant") {
+          lastAssistantMessage = event.message;
+        }
+      });
+
+      const timeout = setTimeout(() => {
+        ctx.abortReason ??= new AgentTimeoutError(this.config.agent.timeoutSeconds);
+        void session.abort();
+      }, this.config.agent.timeoutSeconds * 1000);
+
+      try {
+        await session.prompt(text, { expandPromptTemplates: false });
+        if (ctx.abortReason) throw ctx.abortReason;
+        if (!lastAssistantMessage) throw new Error("Agent completed without an assistant response");
+        if (lastAssistantMessage.stopReason === "aborted") throw new AgentStoppedError();
+        if (lastAssistantMessage.stopReason === "error") throw new Error(lastAssistantMessage.errorMessage ?? "Model request failed");
+        return session.getLastAssistantText() ?? "处理已结束，未返回文字回复";
+      } finally {
+        unsubscribe();
+        clearTimeout(timeout);
+      }
     } finally {
-      unsubscribe();
-      clearTimeout(timeout);
-      this.running = false;
-      this.abortReason = undefined;
+      ctx.running = false;
+      delete ctx.abortReason;
     }
   }
 
-  async stop(): Promise<boolean> {
-    if (!this.running) return false;
-    this.abortReason ??= new AgentStoppedError();
-    await this.session.abort();
+  async stop(channel: string, sessionId: string): Promise<boolean> {
+    const key = this.getSessionKey(channel, sessionId);
+    const ctx = this.sessions.get(key);
+    if (!ctx || !ctx.running) return false;
+    ctx.abortReason ??= new AgentStoppedError();
+    if (ctx.session) await ctx.session.abort();
     return true;
   }
 
-  async reset(): Promise<void> {
-    if (this.running) throw new Error("Stop the current task before creating a new session");
-    const session = await this.openSession(SessionManager.create(this.config.workspaceDir, this.config.sessionsDir));
-    try {
-      const files = (await readdir(this.config.sessionsDir))
-        .filter((name) => name.endsWith(".jsonl"))
-        .map((name) => join(this.config.sessionsDir, name));
-      const currentFile = this.session.sessionFile;
-      // Keep the current file intact if deleting an older session fails.
-      for (const file of files) {
-        if (file !== currentFile) await unlink(file);
+  async stopAll(): Promise<void> {
+    for (const ctx of this.sessions.values()) {
+      if (ctx.running) {
+        ctx.abortReason ??= new AgentStoppedError();
+        if (ctx.session) await ctx.session.abort().catch(() => {});
       }
-      if (currentFile && files.includes(currentFile)) await unlink(currentFile);
-    } catch (error) {
-      session.dispose();
-      throw error;
     }
-    this.session.dispose();
-    this.session = session;
-    this.logger.info({ sessionId: this.session.sessionId }, "cleared session history and created new session");
   }
 
-  status(): PraxAgentStatus {
+  async reset(channel: string, sessionId: string): Promise<void> {
+    const key = this.getSessionKey(channel, sessionId);
+    const ctx = this.sessions.get(key);
+    if (ctx?.running) throw new Error("Stop the current task before creating a new session");
+
+    const workspaceDir = this.getWorkspacePath(channel, sessionId);
+    const sessionsDir = this.getSessionsPath(channel, sessionId);
+    const newSession = await this.createSession(SessionManager.create(workspaceDir, sessionsDir));
+
+    try {
+      const files = (await readdir(sessionsDir))
+        .filter((name) => name.endsWith(".jsonl"))
+        .map((name) => join(sessionsDir, name));
+      const currentFile = ctx?.session?.sessionFile;
+      for (const file of files) {
+        if (file !== currentFile) {
+          await unlink(file);
+        }
+      }
+      if (currentFile && files.includes(currentFile)) {
+        await unlink(currentFile);
+      }
+    } catch (error) {
+      newSession.dispose();
+      throw error;
+    }
+
+    if (ctx) {
+      if (ctx.session) ctx.session.dispose();
+      ctx.session = newSession;
+      ctx.running = false;
+      delete ctx.abortReason;
+    } else {
+      this.sessions.set(key, { session: newSession, running: false });
+    }
+    this.logger.info({ channel, sessionId, piSessionId: newSession.sessionId }, "cleared session history and created new session");
+  }
+
+  status(channel: string, sessionId: string): PraxAgentStatus {
+    const key = this.getSessionKey(channel, sessionId);
+    const ctx = this.sessions.get(key);
+    const session = ctx?.session;
     return {
       version: "0.1.0",
-      running: this.running,
-      provider: this.session.model!.provider,
-      model: this.session.model!.id,
-      hasHistory: this.session.messages.length > 0,
+      running: ctx?.running ?? false,
+      provider: session?.model!.provider ?? this.config.agent.provider,
+      model: session?.model!.id ?? this.config.agent.model,
+      hasHistory: (session?.messages.length ?? 0) > 0,
     };
   }
 
   async dispose(): Promise<void> {
-    if (this.running) await this.stop();
-    this.session.dispose();
+    for (const [key, ctx] of this.sessions) {
+      if (ctx.running && ctx.session) {
+        ctx.abortReason ??= new AgentStoppedError();
+        await ctx.session.abort().catch((err) => this.logger.warn({ err, key }, "failed to abort session during dispose"));
+      }
+      if (ctx.session) ctx.session.dispose();
+    }
+    this.sessions.clear();
   }
 }

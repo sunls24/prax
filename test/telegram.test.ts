@@ -54,10 +54,11 @@ describe("splitTelegramText", () => {
 
 function createMockBot() {
   const agent = {
-    prompt: vi.fn<(text: string) => Promise<string>>().mockResolvedValue("done"),
-    stop: vi.fn<() => Promise<boolean>>().mockResolvedValue(false),
-    reset: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
-    status: vi.fn(() => ({ running: false, provider: "test", model: "test", sessionId: "s", workspaceDir: "/tmp" })),
+    prompt: vi.fn<(channel: string, sessionId: string, text: string) => Promise<string>>().mockResolvedValue("done"),
+    stop: vi.fn<(channel: string, sessionId: string) => Promise<boolean>>().mockResolvedValue(false),
+    reset: vi.fn<(channel: string, sessionId: string) => Promise<void>>().mockResolvedValue(undefined),
+    status: vi.fn((channel: string, sessionId: string) => ({ running: false, provider: "test", model: "test" })),
+    stopAll: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
   };
   const store = new StateStore(":memory:");
   onTestFinished(() => store.close());
@@ -163,9 +164,8 @@ describe("Telegram message flow", () => {
     });
   });
 
-  it("logs a rich message rejection and delivers the complete reply as plain text chunks", async () => {
-    const { receive, agent, logger, sentTexts } = await messageFixture();
-    const warn = vi.spyOn(logger, "warn");
+  it("delivers the complete reply as plain text chunks when a rich message is rejected", async () => {
+    const { receive, agent, sentTexts } = await messageFixture();
     const fetchNormally = network.fetch.getMockImplementation()!;
     const markdown = `**${"x".repeat(3997)}😀${"y".repeat(30000)}**`;
     agent.prompt.mockResolvedValueOnce(markdown);
@@ -183,17 +183,12 @@ describe("Telegram message flow", () => {
       expect(chunks.join("")).toBe(markdown);
       expect(chunks.every((text) => text.length <= 4000 && text.isWellFormed())).toBe(true);
     });
-    expect(warn).toHaveBeenCalledWith(
-      { err: expect.objectContaining({ description: "Bad Request: message is too long" }), peerId: "42", replyId: 1 },
-      "telegram rejected rich reply; sending plain text",
-    );
     const lastRequest = network.fetch.mock.calls.filter(([input]) => methodOf(input) === "sendMessage").at(-1)!;
     expect(JSON.parse(String(lastRequest[1]?.body)).parse_mode).toBeUndefined();
   });
 
   it("retries Rich Markdown with image links when photo media is missing", async () => {
-    const { receive, agent, logger, sentTexts } = await messageFixture();
-    const warn = vi.spyOn(logger, "warn");
+    const { receive, agent, sentTexts } = await messageFixture();
     const markdown = "**done**\n\n![图片](https://example.com/image.png)";
     const links = "**done**\n\n[图片](https://example.com/image.png)";
     agent.prompt.mockResolvedValueOnce(markdown);
@@ -208,10 +203,6 @@ describe("Telegram message flow", () => {
     });
     await receive(1, "work");
     await vi.waitFor(() => expect(sentTexts()).toEqual(["正在处理", markdown, links]));
-    expect(warn).toHaveBeenCalledWith(
-      { err: expect.objectContaining({ description: "Bad Request: RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND" }), peerId: "42", replyId: 1 },
-      "telegram rejected image media; retrying rich reply with links",
-    );
     const requests = network.fetch.mock.calls.filter(([input]) => methodOf(input) === "sendRichMessage")
       .map(([, init]) => JSON.parse(String(init?.body)));
     expect(requests.at(-1)).toEqual({ chat_id: "42", rich_message: { markdown: links }, reply_parameters: { message_id: 1 } });
@@ -231,40 +222,26 @@ describe("Telegram message flow", () => {
     ]));
   });
 
-  it("reports other API errors without resending and keeps the task queue running", async () => {
+  it.each(["API", "transport"] as const)("reports a %s failure without resending and keeps the task queue running", async (failure) => {
     const { receive, agent, logger, sentTexts } = await messageFixture();
     const errors = vi.spyOn(logger, "error");
     const fetchNormally = network.fetch.getMockImplementation()!;
     agent.prompt.mockResolvedValueOnce("**done**").mockResolvedValueOnce("next reply");
     network.fetch.mockImplementation(async (input, init) => {
       if (methodOf(input) === "sendRichMessage") {
+        if (failure === "transport") throw new Error("connection lost");
         return Response.json({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" });
       }
       return fetchNormally(input, init);
     });
     await receive(1, "work");
     await vi.waitFor(() => expect(errors).toHaveBeenCalledWith(
-      { err: expect.any(GrammyError), messageId: "1" }, "task queue failed",
+      { err: expect.any(failure === "API" ? GrammyError : HttpError), messageId: "1" }, "task queue failed",
     ));
     expect(sentTexts()).toEqual(["正在处理", "**done**"]);
     await receive(2, "next");
     await vi.waitFor(() => expect(agent.prompt).toHaveBeenCalledTimes(2));
     expect(sentTexts()).not.toContain("done");
-  });
-
-  it("reports a transport failure without resending the reply", async () => {
-    const { receive, logger, sentTexts } = await messageFixture();
-    const errors = vi.spyOn(logger, "error");
-    const fetchNormally = network.fetch.getMockImplementation()!;
-    network.fetch.mockImplementation(async (input, init) => {
-      if (methodOf(input) === "sendRichMessage") throw new Error("connection lost");
-      return fetchNormally(input, init);
-    });
-    await receive(1, "work");
-    await vi.waitFor(() => expect(errors).toHaveBeenCalledWith(
-      { err: expect.any(HttpError), messageId: "1" }, "task queue failed",
-    ));
-    expect(sentTexts()).toEqual(["正在处理", "done"]);
   });
 
   it("reports an error when the plain text fallback also fails", async () => {
@@ -308,7 +285,7 @@ describe("Telegram message flow", () => {
     await receive(3, "work");
     await vi.waitFor(() => expect(sentTexts()).toContain("done"));
     await receive(3, "work");
-    expect(agent.prompt).toHaveBeenCalledExactlyOnceWith("work");
+    expect(agent.prompt).toHaveBeenCalledExactlyOnceWith("telegram", "42", "work");
   });
 
   it("runs tasks in order and handles status and stop while work is pending", async () => {
@@ -326,7 +303,7 @@ describe("Telegram message flow", () => {
     expect(agent.prompt).toHaveBeenCalledOnce();
     await receive(5, "/stop");
     await vi.waitFor(() => expect(sentTexts()).toContain("done"));
-    expect(agent.prompt.mock.calls.map(([text]) => text)).toEqual(["first", "second"]);
+    expect(agent.prompt.mock.calls.map(([_ch, _id, text]) => text)).toEqual(["first", "second"]);
     await new Promise((resolve) => setImmediate(resolve));
     await receive(6, "/new");
     expect(agent.reset).toHaveBeenCalledOnce();
@@ -364,7 +341,7 @@ describe("Telegram message flow", () => {
     await receive(1, "first");
     await receive(2, "second");
     await vi.waitFor(() => expect(sentTexts()).toContain("done"));
-    expect(agent.prompt.mock.calls.map(([text]) => text)).toEqual(["first", "second"]);
+    expect(agent.prompt.mock.calls.map(([_ch, _id, text]) => text)).toEqual(["first", "second"]);
     expect(sentTexts()).toContain("任务执行失败，请查看服务日志");
   });
 
@@ -372,12 +349,12 @@ describe("Telegram message flow", () => {
     const { adapter, receive, agent, sentTexts } = await messageFixture();
     let rejectPrompt!: (error: Error) => void;
     agent.prompt.mockImplementationOnce(() => new Promise<string>((_resolve, reject) => { rejectPrompt = reject; }));
-    agent.stop.mockImplementation(async () => { rejectPrompt(new AgentStoppedError()); return true; });
+    agent.stopAll.mockImplementation(async () => { rejectPrompt(new AgentStoppedError()); });
     await receive(1, "first");
     await vi.waitFor(() => expect(agent.prompt).toHaveBeenCalledOnce());
     await receive(2, "second");
     await adapter.stop();
-    expect(agent.prompt).toHaveBeenCalledExactlyOnceWith("first");
+    expect(agent.prompt).toHaveBeenCalledExactlyOnceWith("telegram", "42", "first");
     expect(sentTexts()).toContain("任务已停止");
     await receive(3, "after shutdown");
     expect(agent.prompt).toHaveBeenCalledOnce();

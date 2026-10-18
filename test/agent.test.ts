@@ -60,7 +60,14 @@ async function fixture(reply: (response: ServerResponse, requestNumber: number) 
   const createAgent = async () => {
     const agent = await PraxAgent.create({ config, modelApiKey: "fake-test-key", logger: pino({ enabled: false }) });
     agents.push(agent);
-    return agent;
+    return {
+      agent,
+      prompt: (text: string) => agent.prompt("test", "123", text),
+      stop: () => agent.stop("test", "123"),
+      reset: () => agent.reset("test", "123"),
+      status: () => agent.status("test", "123"),
+      dispose: () => agent.dispose(),
+    };
   };
   return { root, requests, config, createAgent };
 }
@@ -84,47 +91,50 @@ describe("PraxAgent with the Pi SDK", () => {
     expect(systemPrompt).toContain("你是 Prax，通过 Telegram");
     expect(systemPrompt).not.toContain("unexpected-system-prompt");
     expect(requests[0]?.tools.map((tool) => tool.function.name).sort()).toEqual(["bash", "edit", "read", "web_fetch", "write"]);
-    expect(await readFile(join(config.workspaceDir, "note.txt"), "utf8")).toBe("hello");
+    const workspacePath = agent.agent.getWorkspacePath("test", "123");
+    expect(await readFile(join(workspacePath, "note.txt"), "utf8")).toBe("hello");
     expect(requests[1]?.messages.some((message) => message.role === "tool")).toBe(true);
     const hasHistory = agent.status().hasHistory;
     await agent.dispose();
 
     const restored = await createAgent();
-    expect(restored.status().hasHistory).toBe(hasHistory);
+    // Session 需要在第一次调用时才被加载，所以先 prompt 再检查 hasHistory
     expect(await restored.prompt("continue the conversation")).toBe("done");
+    expect(restored.status().hasHistory).toBe(hasHistory);
     expect(JSON.stringify(requests[2]?.messages)).toContain("write a note");
-    const [currentFile] = await readdir(config.sessionsDir);
-    await writeFile(join(config.sessionsDir, "older-session.jsonl"), await readFile(join(config.sessionsDir, currentFile!)));
-    await writeFile(join(config.sessionsDir, "keep.txt"), "not a session");
+    const sessionsPath = join(config.sessionsDir, "test-123");
+    const [currentFile] = await readdir(sessionsPath);
+    await writeFile(join(sessionsPath, "older-session.jsonl"), await readFile(join(sessionsPath, currentFile!)));
+    await writeFile(join(sessionsPath, "keep.txt"), "not a session");
     await restored.reset();
     expect(restored.status().hasHistory).toBe(false);
-    expect(await readdir(config.sessionsDir)).toEqual(["keep.txt"]);
+    expect(await readdir(sessionsPath)).toEqual(["keep.txt"]);
     await restored.dispose();
 
     const fresh = await createAgent();
     await fresh.prompt("fresh conversation");
     expect(JSON.stringify(requests[3]?.messages)).not.toContain("write a note");
-    expect(await readFile(join(config.workspaceDir, "note.txt"), "utf8")).toBe("hello");
+    expect(await readFile(join(workspacePath, "note.txt"), "utf8")).toBe("hello");
     await expect(access(join(config.agentDir, "auth.json"))).resolves.toBeUndefined();
     await expect(access(join(root, "unrelated-pi"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("preserves the current conversation when deleting an older history fails", async () => {
+  it.each(["reading", "deleting"] as const)("preserves the current conversation when %s history fails", async (operation) => {
     const { requests, config, createAgent } = await fixture((response) => streamReply(response, { content: "done" }));
     const agent = await createAgent();
     await agent.prompt("old conversation");
-    const [currentFile] = await readdir(config.sessionsDir);
-    const history = await readFile(join(config.sessionsDir, currentFile!), "utf8");
-    const olderFile = join(config.sessionsDir, "older-session.jsonl");
+    const sessionsPath = join(config.sessionsDir, "test-123");
+    const [currentFile] = await readdir(sessionsPath);
+    const history = await readFile(join(sessionsPath, currentFile!), "utf8");
+    const olderFile = join(sessionsPath, "older-session.jsonl");
     await writeFile(olderFile, history);
-    const hadHistory = agent.status().hasHistory;
-    const filesystem = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-    const error = Object.assign(new Error("cannot delete old history"), { code: "EACCES" });
-    vi.mocked(unlink).mockImplementationOnce((path) => path === olderFile ? Promise.reject(error) : filesystem.unlink(path));
+    const error = Object.assign(new Error("cannot clear history"), { code: "EACCES" });
+    if (operation === "reading") vi.mocked(readdir).mockRejectedValueOnce(error);
+    else vi.mocked(unlink).mockRejectedValueOnce(error);
 
     await expect(agent.reset()).rejects.toBe(error);
-    expect(agent.status().hasHistory).toBe(hadHistory);
-    expect(await readFile(join(config.sessionsDir, currentFile!), "utf8")).toBe(history);
+    expect(agent.status().hasHistory).toBe(true);
+    expect(await readFile(join(sessionsPath, currentFile!), "utf8")).toBe(history);
     await agent.prompt("continue after failed reset");
     expect(JSON.stringify(requests[1]?.messages)).toContain("old conversation");
   });
@@ -139,19 +149,24 @@ describe("PraxAgent with the Pi SDK", () => {
     expect(agent.status().running).toBe(false);
   });
 
-  it("keeps service credentials out of the bash environment", async () => {
+  it("keeps bash home per session without exposing service credentials", async () => {
     vi.stubEnv("PRAX_MODEL_API_KEY", "synthetic-service-key");
-    const { requests, createAgent } = await fixture((response, requestNumber) => {
-      if (requestNumber === 1) {
-        streamReply(response, { tool_calls: [{ index: 0, id: "check-env", type: "function", function: {
-          name: "bash", arguments: JSON.stringify({ command: "test -z \"$PRAX_MODEL_API_KEY\" && printf env-clean" }),
+    const { config, createAgent } = await fixture((response, requestNumber) => {
+      if (requestNumber === 1 || requestNumber === 3) {
+        streamReply(response, { tool_calls: [{ index: 0, id: "write-home-note", type: "function", function: {
+          name: "bash", arguments: JSON.stringify({ command: requestNumber === 1
+            ? "test -z \"$PRAX_MODEL_API_KEY\" && cd && printf first > home-note.txt"
+            : "test -z \"$PRAX_MODEL_API_KEY\" && cd ~ && printf second > home-note.txt" }),
         } }] }, "tool_calls");
       } else streamReply(response, { content: "done" });
     });
-    const agent = await createAgent();
-    await agent.prompt("check command environment");
-    const toolMessage = requests[1]?.messages.find((message) => message.role === "tool");
-    expect(JSON.stringify(toolMessage?.content)).toContain("env-clean");
+    const { agent } = await createAgent();
+    await agent.prompt("test", "123", "write the first note");
+    await agent.prompt("test", "456", "write the second note");
+
+    expect(await readFile(join(agent.getWorkspacePath("test", "123"), "home-note.txt"), "utf8")).toBe("first");
+    expect(await readFile(join(agent.getWorkspacePath("test", "456"), "home-note.txt"), "utf8")).toBe("second");
+    await expect(access(join(config.workspaceDir, "home-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("cancels a streaming request and reports the task as stopped", async () => {

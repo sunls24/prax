@@ -80,6 +80,7 @@ export class TelegramBot {
         peerId,
         messageId,
         ctx.message.message_id,
+        userId,
       );
     });
 
@@ -107,15 +108,15 @@ export class TelegramBot {
     }
   }
 
-  private async handleMessage(text: string, peerId: string, messageId: string, replyId: number): Promise<void> {
+  private async handleMessage(text: string, peerId: string, messageId: string, replyId: number, userId: string): Promise<void> {
     const command = commandName(text);
     if (command === "stop") {
-      const stopped = await this.agent.stop();
+      const stopped = await this.agent.stop("telegram", userId);
       await this.reply(peerId, replyId, stopped ? "✓ 任务已停止\n排队任务将继续执行" : "当前无运行中的任务");
       return;
     }
     if (command === "status" || command === "start") {
-      const status = this.agent.status();
+      const status = this.agent.status("telegram", userId);
       const pendingInfo = this.pending > 0 ? ` (${this.pending} 个任务排队)` : "";
       await this.reply(peerId, replyId, [
         `Prax v${status.version}`,
@@ -131,7 +132,7 @@ export class TelegramBot {
         await this.reply(peerId, replyId, `⚠️ 当前有 ${this.pending} 个任务排队\n等待完成后再清空会话，或使用 /stop 停止任务`);
         return;
       }
-      await this.agent.reset();
+      await this.agent.reset("telegram", userId);
       await this.reply(peerId, replyId, `✓ 会话已清空\n历史对话不可恢复，工作区文件保留`);
       return;
     }
@@ -146,18 +147,18 @@ export class TelegramBot {
       .catch((error) => this.logger.warn({ err: error, messageId }, "failed to send acknowledgement"));
 
     this.queue = this.queue
-      .then(() => this.stopController.signal.aborted ? undefined : this.runTask(text, peerId, replyId, messageId))
+      .then(() => this.stopController.signal.aborted ? undefined : this.runTask(text, peerId, replyId, messageId, userId))
       .catch((error) => this.logger.error({ err: error, messageId }, "task queue failed"))
       .finally(() => { this.pending -= 1; });
   }
 
-  private async runTask(text: string, peerId: string, replyId: number, messageId: string): Promise<void> {
+  private async runTask(text: string, peerId: string, replyId: number, messageId: string, userId: string): Promise<void> {
     const startedAt = Date.now();
     this.logger.info({ messageId }, "agent task started");
     let response: string;
     let formatted = false;
     try {
-      response = await this.agent.prompt(text);
+      response = await this.agent.prompt("telegram", userId, text);
       formatted = true;
       this.logger.info({ messageId, durationMs: Date.now() - startedAt }, "agent task completed");
     } catch (error) {
@@ -207,7 +208,7 @@ export class TelegramBot {
   async stop(): Promise<void> {
     this.stopController.abort();
     try {
-      await this.agent.stop();
+      await this.agent.stopAll();
       await this.queue;
     } finally {
       await this.bot.stop();
