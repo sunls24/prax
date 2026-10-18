@@ -9,7 +9,9 @@ import type { AppConfig } from "./config.js";
 function isPrivateIp(address: string): boolean {
   const parts = address.split(".").map(Number);
   const [a, b] = parts as [number, number, number, number];
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 export function assertPublicHttpUrl(input: string): URL {
@@ -17,8 +19,10 @@ export function assertPublicHttpUrl(input: string): URL {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Only HTTP and HTTPS URLs are allowed");
   }
-  const hostname = url.hostname.toLowerCase();
-  if (hostname === "localhost" || (isIP(hostname) === 4 && isPrivateIp(hostname))) {
+  // Basic URL guard only: DNS/connection-level isolation is outside this tool's scope.
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (hostname.startsWith("[")) throw new Error("IPv6 URL literals are not supported");
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || (isIP(hostname) === 4 && isPrivateIp(hostname))) {
     throw new Error("Private addresses are not allowed");
   }
   return url;

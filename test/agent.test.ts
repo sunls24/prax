@@ -7,6 +7,10 @@ import pino from "pino";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { AgentStoppedError, AgentTimeoutError, PraxAgent } from "../src/agent.js";
 import { loadConfig } from "../src/config.js";
+import { sessionPath } from "../src/session.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+
+const identity = { channel: "test", accountId: "default", conversationId: "123" };
 
 vi.mock("node:fs/promises", { spy: true });
 
@@ -60,7 +64,14 @@ async function fixture(reply: (response: ServerResponse, requestNumber: number) 
   const createAgent = async () => {
     const agent = await PraxAgent.create({ config, modelApiKey: "fake-test-key", logger: pino({ enabled: false }) });
     agents.push(agent);
-    return agent;
+    return {
+      agent,
+      prompt: (text: string) => agent.prompt(identity, text),
+      stop: () => agent.stop(identity),
+      reset: () => agent.reset(identity),
+      status: () => agent.status(identity),
+      dispose: () => agent.dispose(),
+    };
   };
   return { root, requests, config, createAgent };
 }
@@ -84,47 +95,49 @@ describe("PraxAgent with the Pi SDK", () => {
     expect(systemPrompt).toContain("你是 Prax，通过 Telegram");
     expect(systemPrompt).not.toContain("unexpected-system-prompt");
     expect(requests[0]?.tools.map((tool) => tool.function.name).sort()).toEqual(["bash", "edit", "read", "web_fetch", "write"]);
-    expect(await readFile(join(config.workspaceDir, "note.txt"), "utf8")).toBe("hello");
+    const workspacePath = agent.agent.getWorkspacePath(identity);
+    expect(await readFile(join(workspacePath, "note.txt"), "utf8")).toBe("hello");
     expect(requests[1]?.messages.some((message) => message.role === "tool")).toBe(true);
-    const hasHistory = agent.status().hasHistory;
     await agent.dispose();
 
     const restored = await createAgent();
-    expect(restored.status().hasHistory).toBe(hasHistory);
+    expect((await restored.status()).hasHistory).toBe(true);
+    expect(requests).toHaveLength(2);
     expect(await restored.prompt("continue the conversation")).toBe("done");
     expect(JSON.stringify(requests[2]?.messages)).toContain("write a note");
-    const [currentFile] = await readdir(config.sessionsDir);
-    await writeFile(join(config.sessionsDir, "older-session.jsonl"), await readFile(join(config.sessionsDir, currentFile!)));
-    await writeFile(join(config.sessionsDir, "keep.txt"), "not a session");
+    const sessionsPath = sessionPath(config.sessionsDir, identity);
+    const [currentFile] = await readdir(sessionsPath);
+    await writeFile(join(sessionsPath, "older-session.jsonl"), await readFile(join(sessionsPath, currentFile!)));
+    await writeFile(join(sessionsPath, "keep.txt"), "not a session");
     await restored.reset();
-    expect(restored.status().hasHistory).toBe(false);
-    expect(await readdir(config.sessionsDir)).toEqual(["keep.txt"]);
+    expect((await restored.status()).hasHistory).toBe(false);
+    expect(await readdir(sessionsPath)).toEqual(["keep.txt"]);
     await restored.dispose();
 
     const fresh = await createAgent();
     await fresh.prompt("fresh conversation");
     expect(JSON.stringify(requests[3]?.messages)).not.toContain("write a note");
-    expect(await readFile(join(config.workspaceDir, "note.txt"), "utf8")).toBe("hello");
+    expect(await readFile(join(workspacePath, "note.txt"), "utf8")).toBe("hello");
     await expect(access(join(config.agentDir, "auth.json"))).resolves.toBeUndefined();
     await expect(access(join(root, "unrelated-pi"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("preserves the current conversation when deleting an older history fails", async () => {
+  it.each(["reading", "deleting"] as const)("preserves the current conversation when %s history fails", async (operation) => {
     const { requests, config, createAgent } = await fixture((response) => streamReply(response, { content: "done" }));
     const agent = await createAgent();
     await agent.prompt("old conversation");
-    const [currentFile] = await readdir(config.sessionsDir);
-    const history = await readFile(join(config.sessionsDir, currentFile!), "utf8");
-    const olderFile = join(config.sessionsDir, "older-session.jsonl");
+    const sessionsPath = sessionPath(config.sessionsDir, identity);
+    const [currentFile] = await readdir(sessionsPath);
+    const history = await readFile(join(sessionsPath, currentFile!), "utf8");
+    const olderFile = join(sessionsPath, "older-session.jsonl");
     await writeFile(olderFile, history);
-    const hadHistory = agent.status().hasHistory;
-    const filesystem = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-    const error = Object.assign(new Error("cannot delete old history"), { code: "EACCES" });
-    vi.mocked(unlink).mockImplementationOnce((path) => path === olderFile ? Promise.reject(error) : filesystem.unlink(path));
+    const error = Object.assign(new Error("cannot clear history"), { code: "EACCES" });
+    if (operation === "reading") vi.mocked(readdir).mockRejectedValueOnce(error);
+    else vi.mocked(unlink).mockRejectedValueOnce(error);
 
     await expect(agent.reset()).rejects.toBe(error);
-    expect(agent.status().hasHistory).toBe(hadHistory);
-    expect(await readFile(join(config.sessionsDir, currentFile!), "utf8")).toBe(history);
+    expect((await agent.status()).hasHistory).toBe(true);
+    expect(await readFile(join(sessionsPath, currentFile!), "utf8")).toBe(history);
     await agent.prompt("continue after failed reset");
     expect(JSON.stringify(requests[1]?.messages)).toContain("old conversation");
   });
@@ -136,39 +149,27 @@ describe("PraxAgent with the Pi SDK", () => {
     });
     const agent = await createAgent();
     await expect(agent.prompt("work")).rejects.toThrow("invalid API protocol");
-    expect(agent.status().running).toBe(false);
+    expect((await agent.status()).running).toBe(false);
   });
 
-  it("keeps service credentials out of the bash environment", async () => {
+  it("keeps bash home per session without exposing service credentials", async () => {
     vi.stubEnv("PRAX_MODEL_API_KEY", "synthetic-service-key");
-    const { requests, createAgent } = await fixture((response, requestNumber) => {
-      if (requestNumber === 1) {
-        streamReply(response, { tool_calls: [{ index: 0, id: "check-env", type: "function", function: {
-          name: "bash", arguments: JSON.stringify({ command: "test -z \"$PRAX_MODEL_API_KEY\" && printf env-clean" }),
+    const { config, createAgent } = await fixture((response, requestNumber) => {
+      if (requestNumber === 1 || requestNumber === 3) {
+        streamReply(response, { tool_calls: [{ index: 0, id: "write-home-note", type: "function", function: {
+          name: "bash", arguments: JSON.stringify({ command: requestNumber === 1
+            ? "test -z \"$PRAX_MODEL_API_KEY\" && cd && printf first > home-note.txt"
+            : "test -z \"$PRAX_MODEL_API_KEY\" && cd ~ && printf second > home-note.txt" }),
         } }] }, "tool_calls");
       } else streamReply(response, { content: "done" });
     });
-    const agent = await createAgent();
-    await agent.prompt("check command environment");
-    const toolMessage = requests[1]?.messages.find((message) => message.role === "tool");
-    expect(JSON.stringify(toolMessage?.content)).toContain("env-clean");
-  });
+    const { agent } = await createAgent();
+    await agent.prompt(identity, "write the first note");
+    await agent.prompt({ ...identity, conversationId: "456" }, "write the second note");
 
-  it("cancels a streaming request and reports the task as stopped", async () => {
-    let started!: () => void;
-    const requestStarted = new Promise<void>((resolve) => { started = resolve; });
-    const { createAgent } = await fixture((response) => {
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.write(": waiting\n\n");
-      started();
-    });
-    const agent = await createAgent();
-    const result = expect(agent.prompt("wait")).rejects.toBeInstanceOf(AgentStoppedError);
-    await requestStarted;
-    expect(agent.status().running).toBe(true);
-    expect(await agent.stop()).toBe(true);
-    await result;
-    expect(agent.status().running).toBe(false);
+    expect(await readFile(join(agent.getWorkspacePath(identity), "home-note.txt"), "utf8")).toBe("first");
+    expect(await readFile(join(agent.getWorkspacePath({ ...identity, conversationId: "456" }), "home-note.txt"), "utf8")).toBe("second");
+    await expect(access(join(config.workspaceDir, "home-note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("honors cancellation during prompt preflight before making a model request", async () => {
@@ -187,6 +188,134 @@ describe("PraxAgent with the Pi SDK", () => {
     }, 1);
     const agent = await createAgent();
     await expect(agent.prompt("wait")).rejects.toBeInstanceOf(AgentTimeoutError);
-    expect(agent.status().running).toBe(false);
+    expect((await agent.status()).running).toBe(false);
   });
+
+  it("initializes one session when status and the first prompt arrive together", async () => {
+    const { createAgent, requests } = await fixture((response) => streamReply(response, { content: "done" }));
+    const recent = vi.spyOn(SessionManager, "continueRecent");
+    const agent = await createAgent();
+    await Promise.all([agent.status(), agent.prompt("first message"), agent.status()]);
+    expect(recent).toHaveBeenCalledOnce();
+    expect(requests).toHaveLength(1);
+    expect((await agent.status()).hasHistory).toBe(true);
+  });
+
+  it("isolates files and history across accounts and channels on case-insensitive filesystems", async () => {
+    const { createAgent, requests } = await fixture((response) => streamReply(response, { content: "done" }));
+    const { agent } = await createAgent();
+    const first = { ...identity, accountId: "aaN" };
+    const second = { ...identity, accountId: "aah" };
+    const otherChannel = { ...first, channel: "web" };
+    const firstWorkspace = agent.getWorkspacePath(first);
+    const secondWorkspace = agent.getWorkspacePath(second);
+    expect(new Set([first, second, otherChannel].map((id) => agent.getWorkspacePath(id).toLowerCase())).size).toBe(3);
+    await agent.prompt(first, "history for first account");
+    await agent.prompt(second, "history for second account");
+    await agent.prompt(otherChannel, "history for other channel");
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("history for first account");
+    expect(JSON.stringify(requests[2]?.messages)).not.toContain("history for first account");
+    expect(JSON.stringify(requests[2]?.messages)).not.toContain("history for second account");
+    await writeFile(join(firstWorkspace, "note.txt"), "first account file");
+    await writeFile(join(secondWorkspace, "note.txt"), "second account file");
+    expect(await readFile(join(firstWorkspace, "note.txt"), "utf8")).toBe("first account file");
+    await agent.reset(second);
+    expect(await readFile(join(secondWorkspace, "note.txt"), "utf8")).toBe("second account file");
+    await agent.dispose();
+
+    const restarted = await createAgent();
+    expect((await restarted.agent.status(first)).hasHistory).toBe(true);
+    expect((await restarted.agent.status(second)).hasHistory).toBe(false);
+    expect((await restarted.agent.status(otherChannel)).hasHistory).toBe(true);
+    await restarted.agent.prompt(first, "continue");
+    expect(JSON.stringify(requests[3]?.messages)).toContain("history for first account");
+    expect(JSON.stringify(requests[3]?.messages)).not.toContain("history for second account");
+    expect(JSON.stringify(requests[3]?.messages)).not.toContain("history for other channel");
+  });
+
+  it("serializes one conversation while another runs and resets independently", async () => {
+    const { createAgent, requests } = await fixture((response, requestNumber) => {
+      if (requestNumber === 1) {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(": waiting\n\n");
+      } else streamReply(response, { content: "done" });
+    });
+    const { agent } = await createAgent();
+    const other = { ...identity, accountId: "other" };
+    const completed: string[] = [];
+    const cancel = vi.fn(async () => {});
+    agent.enqueue(identity, async () => {
+      try { await agent.prompt(identity, "first"); }
+      catch (error) {
+        if (!(error instanceof AgentStoppedError)) throw error;
+        completed.push("first stopped");
+      }
+    }, cancel);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    agent.enqueue(identity, async () => { await agent.prompt(identity, "second"); completed.push("second"); }, cancel);
+    agent.enqueue(other, async () => { await agent.prompt(other, "independent"); completed.push("independent"); }, cancel);
+    await vi.waitFor(() => expect(completed).toEqual(["independent"]));
+    expect(await agent.status(identity)).toMatchObject({ running: true, pending: 1 });
+    expect(await agent.status(other)).toMatchObject({ running: false, pending: 0 });
+    await agent.reset(other);
+    expect((await agent.status(other)).hasHistory).toBe(false);
+    expect(await agent.stop(identity)).toBe(true);
+    await vi.waitFor(() => expect(completed).toEqual(["independent", "first stopped", "second"]));
+    expect(requests).toHaveLength(3);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(await agent.status(identity)).toMatchObject({ running: false, pending: 0 });
+  });
+
+  it("waits for a reset before processing a new prompt or status query", async () => {
+    const { createAgent, requests } = await fixture((response) => streamReply(response, { content: "done" }));
+    const agent = await createAgent();
+    await agent.prompt("old conversation");
+    await Promise.all([agent.reset(), agent.status(), agent.prompt("new conversation")]);
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("old conversation");
+    expect((await agent.status()).hasHistory).toBe(true);
+  });
+
+  it("aborts running work and waits for queued cancellation during shutdown", async () => {
+    const { createAgent, requests } = await fixture((response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": waiting\n\n");
+    });
+    const { agent } = await createAgent();
+    const stopped = vi.fn();
+    const queuedRun = vi.fn(async () => {});
+    let finishCancellation!: () => void;
+    const cancel = vi.fn(() => new Promise<void>((resolve) => { finishCancellation = resolve; }));
+    agent.enqueue(identity, async () => {
+      try { await agent.prompt(identity, "running"); }
+      catch (error) {
+        if (!(error instanceof AgentStoppedError)) throw error;
+        stopped();
+      }
+    }, cancel);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    agent.enqueue(identity, queuedRun, cancel);
+    const finished = vi.fn();
+    const shutdown = agent.stopAll().then(finished);
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    expect(stopped).toHaveBeenCalledOnce();
+    expect(queuedRun).not.toHaveBeenCalled();
+    expect(finished).not.toHaveBeenCalled();
+    finishCancellation();
+    await shutdown;
+    expect(() => agent.enqueue(identity, queuedRun, cancel)).toThrow("shutting down");
+  });
+
+  it("exposes workspace write failures to the model without changing outside files", async () => {
+    const { createAgent, requests } = await fixture((response, requestNumber) => {
+      if (requestNumber === 1) streamReply(response, { tool_calls: [{ index: 0, id: "outside-write", type: "function", function: {
+        name: "write", arguments: JSON.stringify({ path: "../outside.txt", content: "changed" }),
+      } }] }, "tool_calls");
+      else streamReply(response, { content: "done" });
+    });
+    const agent = await createAgent();
+    expect(await agent.prompt("write a file")).toBe("done");
+    expect(JSON.stringify(requests[1]?.messages.filter((message) => message.role === "tool"))).toContain("inside the current workspace");
+    await expect(access(join(agent.agent.getWorkspacePath(identity), "../outside.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
 });

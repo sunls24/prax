@@ -70,8 +70,7 @@ async function run(): Promise<void> {
         logger.info(
           {
             configPath: config.configPath,
-            workspaceDir: config.workspaceDir,
-            version: agent.status().version,
+            dataDir: config.dataDir,
           },
           "Prax started",
         );

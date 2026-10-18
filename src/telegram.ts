@@ -1,10 +1,12 @@
 import { Bot, GrammyError, HttpError } from "grammy";
 import type { Logger } from "pino";
-import { AgentStoppedError, AgentTimeoutError, type PraxAgent } from "./agent.js";
+import { AgentStoppedError, AgentTimeoutError, SessionBusyError, type PraxAgent } from "./agent.js";
 import type { StateStore } from "./state.js";
 import { markdownImagesToLinks } from "./markdown-images.js";
+import type { SessionIdentity } from "./session.js";
 
 const SAFE_CHUNK_SIZE = 4000;
+type TelegramAbortSignal = NonNullable<Parameters<Bot["init"]>[0]>;
 
 export function splitTelegramText(text: string): string[] {
   if (text.length <= SAFE_CHUNK_SIZE) return [text];
@@ -34,8 +36,6 @@ function commandName(text: string): string | undefined {
 export class TelegramBot {
   private readonly bot: Bot;
   private readonly stopController = new AbortController();
-  private queue: Promise<void> = Promise.resolve();
-  private pending = 0;
 
   constructor(
     token: string,
@@ -69,21 +69,19 @@ export class TelegramBot {
 
       const messageId = ctx.message.message_id.toString();
       const peerId = ctx.chat.id.toString();
+      const identity = this.identity(peerId);
+      const text = ctx.message.text.trim();
+      if (!text) return;
 
-      if (!this.store.claimMessage("telegram", this.accountId, peerId, messageId)) {
+      if (!this.store.claimMessage(identity, messageId, !commandName(text))) {
         this.logger.info({ messageId }, "ignored duplicate message");
         return;
       }
 
-      await this.handleMessage(
-        ctx.message.text.trim(),
-        peerId,
-        messageId,
-        ctx.message.message_id,
-      );
+      await this.handleMessage(text, identity, messageId);
     });
 
-    const signal = this.stopController.signal as unknown as NonNullable<Parameters<Bot["init"]>[0]>;
+    const signal = this.stopController.signal as unknown as TelegramAbortSignal;
     try {
       await this.bot.init(signal);
       await this.bot.api.setMyCommands([
@@ -91,6 +89,8 @@ export class TelegramBot {
         { command: "stop", description: "停止当前任务" },
         { command: "new", description: "清空会话（不可恢复）" },
       ], {}, signal);
+      if (signal.aborted) return;
+      await this.reportInterruptedTasks(signal);
       if (signal.aborted) return;
 
       await this.bot.start({
@@ -107,16 +107,39 @@ export class TelegramBot {
     }
   }
 
-  private async handleMessage(text: string, peerId: string, messageId: string, replyId: number): Promise<void> {
+  private identity(conversationId: string): SessionIdentity {
+    return { channel: "telegram", accountId: this.accountId, conversationId };
+  }
+
+  private async reportInterruptedTasks(signal: TelegramAbortSignal): Promise<void> {
+    for (const task of this.store.unfinishedTasks("telegram", this.accountId)) {
+      if (signal.aborted) return;
+      if (!this.allowedUserIds.has(task.conversationId)) continue;
+      const text = task.state === "queued"
+        ? "上次服务中断，此任务尚未执行，已取消。需要继续请重新发送。"
+        : "上次任务未确认完成，执行过的操作不会自动撤销。请检查结果后再决定是否重新发送。";
+      try {
+        await this.reply(task.conversationId, Number(task.messageId), text, false, signal);
+        this.store.finishTask(this.identity(task.conversationId), task.messageId);
+      } catch (err) {
+        if (signal.aborted) return;
+        this.logger.error({ err, task }, "failed to report interrupted task");
+      }
+    }
+  }
+
+  private async handleMessage(text: string, identity: SessionIdentity, messageId: string): Promise<void> {
+    const peerId = identity.conversationId;
+    const replyId = Number(messageId);
     const command = commandName(text);
     if (command === "stop") {
-      const stopped = await this.agent.stop();
+      const stopped = await this.agent.stop(identity);
       await this.reply(peerId, replyId, stopped ? "✓ 任务已停止\n排队任务将继续执行" : "当前无运行中的任务");
       return;
     }
     if (command === "status" || command === "start") {
-      const status = this.agent.status();
-      const pendingInfo = this.pending > 0 ? ` (${this.pending} 个任务排队)` : "";
+      const status = await this.agent.status(identity);
+      const pendingInfo = status.pending > 0 ? ` (${status.pending} 个任务排队)` : "";
       await this.reply(peerId, replyId, [
         `Prax v${status.version}`,
         "━━━━━━━━━━━━━━━━━━",
@@ -127,11 +150,13 @@ export class TelegramBot {
       return;
     }
     if (command === "new") {
-      if (this.pending > 0) {
-        await this.reply(peerId, replyId, `⚠️ 当前有 ${this.pending} 个任务排队\n等待完成后再清空会话，或使用 /stop 停止任务`);
+      try {
+        await this.agent.reset(identity);
+      } catch (error) {
+        if (!(error instanceof SessionBusyError)) throw error;
+        await this.reply(peerId, replyId, `⚠️ ${error.message}`);
         return;
       }
-      await this.agent.reset();
       await this.reply(peerId, replyId, `✓ 会话已清空\n历史对话不可恢复，工作区文件保留`);
       return;
     }
@@ -139,25 +164,27 @@ export class TelegramBot {
       await this.reply(peerId, replyId, "未知命令，可用命令：/new、/stop、/status");
       return;
     }
-    if (!text) return;
-
-    this.pending += 1;
-    await this.reply(peerId, replyId, this.pending > 1 ? "已加入队列，将按顺序处理" : "正在处理")
+    const acknowledgement = this.reply(peerId, replyId, this.agent.isBusy(identity) ? "已加入队列，将按顺序处理" : "正在处理")
       .catch((error) => this.logger.warn({ err: error, messageId }, "failed to send acknowledgement"));
-
-    this.queue = this.queue
-      .then(() => this.stopController.signal.aborted ? undefined : this.runTask(text, peerId, replyId, messageId))
-      .catch((error) => this.logger.error({ err: error, messageId }, "task queue failed"))
-      .finally(() => { this.pending -= 1; });
+    this.agent.enqueue(identity,
+      () => this.runTask(text, identity, messageId, acknowledgement),
+      async () => {
+        await acknowledgement;
+        await this.reply(peerId, replyId, "服务正在关闭，此任务尚未执行，已取消。需要继续请重新发送。");
+        this.store.finishTask(identity, messageId);
+      },
+    );
+    await acknowledgement;
   }
 
-  private async runTask(text: string, peerId: string, replyId: number, messageId: string): Promise<void> {
+  private async runTask(text: string, identity: SessionIdentity, messageId: string, acknowledgement: Promise<void>): Promise<void> {
     const startedAt = Date.now();
     this.logger.info({ messageId }, "agent task started");
     let response: string;
     let formatted = false;
+    this.store.startTask(identity, messageId);
     try {
-      response = await this.agent.prompt(text);
+      response = await this.agent.prompt(identity, text);
       formatted = true;
       this.logger.info({ messageId, durationMs: Date.now() - startedAt }, "agent task completed");
     } catch (error) {
@@ -170,17 +197,19 @@ export class TelegramBot {
         response = "任务执行失败，请查看服务日志";
       }
     }
-    await this.reply(peerId, replyId, response, formatted);
+    await acknowledgement;
+    await this.reply(identity.conversationId, Number(messageId), response, formatted);
+    this.store.finishTask(identity, messageId);
   }
 
-  private async reply(peerId: string, replyId: number, text: string, formatted = false): Promise<void> {
+  private async reply(peerId: string, replyId: number, text: string, formatted = false, signal?: TelegramAbortSignal): Promise<void> {
     if (formatted) {
       let markdown = text;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           await this.bot.api.sendRichMessage(peerId, { markdown }, {
-            reply_parameters: { message_id: replyId },
-          });
+            reply_parameters: { message_id: replyId, allow_sending_without_reply: true },
+          }, signal);
           return;
         } catch (error) {
           if (!(error instanceof GrammyError) || error.error_code !== 400) throw error;
@@ -199,18 +228,15 @@ export class TelegramBot {
     }
     for (const chunk of splitTelegramText(text)) {
       await this.bot.api.sendMessage(peerId, chunk, {
-        reply_parameters: { message_id: replyId },
-      });
+        reply_parameters: { message_id: replyId, allow_sending_without_reply: true },
+      }, signal);
     }
   }
 
   async stop(): Promise<void> {
     this.stopController.abort();
-    try {
-      await this.agent.stop();
-      await this.queue;
-    } finally {
-      await this.bot.stop();
-    }
+    const results = await Promise.allSettled([this.bot.stop(), this.agent.stopAll()]);
+    const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if (errors.length) throw new AggregateError(errors, "Failed to stop Telegram service");
   }
 }

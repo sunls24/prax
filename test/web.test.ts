@@ -31,11 +31,25 @@ describe("fetchPage", () => {
   it("rejects local and non-HTTP URLs before making a request", async () => {
     for (const url of [
       "http://localhost/", "http://127.0.0.1/", "http://10.0.0.1/", "http://172.16.0.1/", "http://192.168.1.1/",
+      "http://localhost./", "http://service.localhost/", "http://0.0.0.0/", "http://169.254.169.254/",
+      "http://100.64.0.1/", "http://224.0.0.1/", "http://2130706433/", "http://0x7f000001/",
       "file:///etc/passwd", "ftp://example.test/",
     ]) {
       await expect(fetchPage(url, options)).rejects.toThrow(/Private|HTTP/);
     }
     expect(http.fetch).not.toHaveBeenCalled();
+  });
+
+  it("explicitly rejects IPv6 literals, including redirect targets", async () => {
+    for (const url of ["http://[::1]/", "http://[::ffff:127.0.0.1]/", "https://[2606:4700:4700::1111]/"]) {
+      await expect(fetchPage(url, options)).rejects.toThrow("IPv6");
+    }
+    expect(http.fetch).not.toHaveBeenCalled();
+    const redirect = new Response("redirect", { status: 302, headers: { location: "http://[::1]/admin" } });
+    http.fetch.mockResolvedValueOnce(redirect);
+    await expect(fetchPage("https://example.test", options)).rejects.toThrow("IPv6");
+    expect(http.fetch).toHaveBeenCalledOnce();
+    expect(redirect.bodyUsed).toBe(true);
   });
 
   it("extracts public page text and truncates it", async () => {
