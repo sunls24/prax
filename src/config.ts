@@ -12,8 +12,11 @@ export interface ConfigInput {
     thinkingLevel?: ThinkingLevel;
     timeoutSeconds?: number;
   };
-  telegram: {
+  telegram?: {
     accountId?: string;
+    allowedUserIds: string[];
+  };
+  weixin?: {
     allowedUserIds: string[];
   };
   webSearch?: {
@@ -43,7 +46,8 @@ export interface AppPaths {
 
 export type AppConfig = AppPaths & {
   agent: Required<ConfigInput["agent"]>;
-  telegram: Required<ConfigInput["telegram"]>;
+  telegram?: Required<NonNullable<ConfigInput["telegram"]>>;
+  weixin?: NonNullable<ConfigInput["weixin"]>;
   webSearch: Required<NonNullable<ConfigInput["webSearch"]>>;
   webFetch: Required<NonNullable<ConfigInput["webFetch"]>>;
 };
@@ -73,8 +77,15 @@ export function parseConfig(input: ConfigInput, path: string): AppConfig {
   if (!input?.agent?.provider || !input.agent.model) {
     throw new Error("Missing required fields: agent.provider and agent.model");
   }
-  if (!input.telegram?.allowedUserIds?.length) {
+  if (!input.telegram && !input.weixin) {
+    throw new Error("At least one messaging channel is required: telegram or weixin");
+  }
+  if (input.telegram && !input.telegram.allowedUserIds?.length) {
     throw new Error("Missing required field: telegram.allowedUserIds");
+  }
+  if (input.weixin && (!Array.isArray(input.weixin.allowedUserIds) || !input.weixin.allowedUserIds.length
+    || input.weixin.allowedUserIds.some((id) => typeof id !== "string" || !id.trim()))) {
+    throw new Error("Missing or invalid field: weixin.allowedUserIds");
   }
   const webSearch = input.webSearch ?? { enabled: false };
   const webFetch = input.webFetch ?? { enabled: true };
@@ -87,10 +98,11 @@ export function parseConfig(input: ConfigInput, path: string): AppConfig {
       thinkingLevel: input.agent.thinkingLevel ?? "medium",
       timeoutSeconds: input.agent.timeoutSeconds ?? 300,
     },
-    telegram: {
+    ...(input.telegram ? { telegram: {
       accountId: input.telegram.accountId ?? "default",
       allowedUserIds: input.telegram.allowedUserIds,
-    },
+    } } : {}),
+    ...(input.weixin ? { weixin: { allowedUserIds: input.weixin.allowedUserIds } } : {}),
     webSearch: {
       enabled: webSearch.enabled,
       maxResults: webSearch.maxResults ?? 5,

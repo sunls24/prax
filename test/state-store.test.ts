@@ -21,10 +21,18 @@ describe("StateStore", () => {
     store.claimMessage({ ...identity, accountId: "bot-b" }, "1", true);
     store.claimMessage({ ...identity, channel: "web" }, "1", true);
     store.claimMessage(identity, "3");
+    expect(store.getCursor("weixin", "bot-a")).toBe("");
+    store.saveCursor("weixin", "bot-a", "first-cursor");
+    store.saveCursor("weixin", "bot-a", "second-cursor");
+    store.saveCursor("weixin", "bot-b", "other-account");
+    store.saveCursor("telegram", "bot-a", "other-channel");
     const otherPeer = { ...identity, conversationId: "43" };
     expect(store.claimMessage(otherPeer, "1")).toBe(true);
     store.close();
     store = new StateStore(path);
+    expect(store.getCursor("weixin", "bot-a")).toBe("second-cursor");
+    expect(store.getCursor("weixin", "bot-b")).toBe("other-account");
+    expect(store.getCursor("telegram", "bot-a")).toBe("other-channel");
     expect(store.unfinishedTasks("telegram", "bot-a")).toEqual([
       { conversationId: "42", messageId: "1", state: "queued" },
       { conversationId: "42", messageId: "2", state: "running" },

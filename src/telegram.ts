@@ -4,34 +4,11 @@ import { AgentStoppedError, AgentTimeoutError, SessionBusyError, type PraxAgent 
 import type { StateStore } from "./state.js";
 import { markdownImagesToLinks } from "./markdown-images.js";
 import type { SessionIdentity } from "./session.js";
+import { commandName, splitText } from "./messaging.js";
 
-const SAFE_CHUNK_SIZE = 4000;
 type TelegramAbortSignal = NonNullable<Parameters<Bot["init"]>[0]>;
 
-export function splitTelegramText(text: string): string[] {
-  if (text.length <= SAFE_CHUNK_SIZE) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= SAFE_CHUNK_SIZE) {
-      chunks.push(remaining);
-      break;
-    }
-    const candidate = remaining.slice(0, SAFE_CHUNK_SIZE);
-    const newlinePos = candidate.lastIndexOf("\n");
-    const spacePos = candidate.lastIndexOf(" ");
-    let cut = newlinePos > 0 ? newlinePos : spacePos > 0 ? spacePos : SAFE_CHUNK_SIZE;
-    if (/[\uD800-\uDBFF]/.test(remaining[cut - 1]!)) cut -= 1;
-    chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut);
-  }
-  return chunks;
-}
-
-function commandName(text: string): string | undefined {
-  if (!text.startsWith("/")) return undefined;
-  return text.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
-}
+export { splitText as splitTelegramText } from "./messaging.js";
 
 export class TelegramBot {
   private readonly bot: Bot;
@@ -226,7 +203,7 @@ export class TelegramBot {
         }
       }
     }
-    for (const chunk of splitTelegramText(text)) {
+    for (const chunk of splitText(text)) {
       await this.bot.api.sendMessage(peerId, chunk, {
         reply_parameters: { message_id: replyId, allow_sending_without_reply: true },
       }, signal);
@@ -235,8 +212,6 @@ export class TelegramBot {
 
   async stop(): Promise<void> {
     this.stopController.abort();
-    const results = await Promise.allSettled([this.bot.stop(), this.agent.stopAll()]);
-    const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
-    if (errors.length) throw new AggregateError(errors, "Failed to stop Telegram service");
+    await this.bot.stop();
   }
 }

@@ -17,7 +17,7 @@ import { createWebFetchTool, createWebSearchTool, type TavilySearchProvider } fr
 import { sessionKey, sessionPath, type SessionIdentity } from "./session.js";
 import { createWorkspaceFileTools } from "./workspace-tools.js";
 
-const PRAX_INSTRUCTIONS = `你是 Prax，通过 Telegram 协助用户完成日常问答、资料检索和工作区任务。
+const PRAX_INSTRUCTIONS = `你是 Prax，通过消息渠道协助用户完成日常问答、资料检索和工作区任务。
 
 - 默认用中文，先给结论，再按任务需要补充细节，避免复述。
 - 普通问答直接回答，仅在任务需要时使用工具。咨询或分析只做必要的只读检查；实施任务在授权范围内完成，不重复确认。

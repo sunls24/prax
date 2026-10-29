@@ -8,20 +8,23 @@ import { TavilySearchProvider } from "./web.js";
 import { readSecret, redactTelegramToken } from "./secrets.js";
 import { StateStore } from "./state.js";
 import { configure } from "./configure.js";
+import { WeixinBot } from "./weixin.js";
+import { loadWeixinAccount } from "./weixin-api.js";
 
 async function run(): Promise<void> {
   const logger = pino({
     level: process.env.LOG_LEVEL ?? "info",
     hooks: { streamWrite: redactTelegramToken },
     redact: {
-      paths: ["*.token", "*.apiKey", "*.authorization", "req.headers.authorization", "req.headers.cookie"],
+      paths: ["*.token", "*.bot_token", "*.context_token", "*.apiKey", "*.authorization", "req.headers.authorization", "req.headers.cookie"],
       censor: "[REDACTED]",
     },
   });
   const config = await loadConfig();
-  const [modelApiKey, telegramToken, tavilyApiKey] = await Promise.all([
+  const [modelApiKey, telegramToken, weixinAccount, tavilyApiKey] = await Promise.all([
     readSecret("PRAX_MODEL_API_KEY", true, resolve(config.secretsDir, "model-api-key")),
-    readSecret("TELEGRAM_BOT_TOKEN", true, resolve(config.secretsDir, "telegram-token")),
+    config.telegram ? readSecret("TELEGRAM_BOT_TOKEN", true, resolve(config.secretsDir, "telegram-token")) : undefined,
+    config.weixin ? loadWeixinAccount(resolve(config.secretsDir, "weixin-account.json")) : undefined,
     config.webSearch.enabled ? readSecret("TAVILY_API_KEY", true, resolve(config.secretsDir, "tavily-api-key")) : undefined,
   ]);
   const searchProvider = tavilyApiKey
@@ -36,21 +39,24 @@ async function run(): Promise<void> {
       ...(searchProvider ? { searchProvider } : {}),
       logger,
     });
-    const telegram = new TelegramBot(
-      telegramToken,
-      config.telegram.accountId,
-      new Set(config.telegram.allowedUserIds),
-      agent,
-      store,
-      logger,
-    );
+    const channels = [
+      ...(config.telegram ? [{ name: "telegram", bot: new TelegramBot(
+        telegramToken!, config.telegram.accountId, new Set(config.telegram.allowedUserIds), agent, store, logger,
+      ) }] : []),
+      ...(config.weixin ? [{ name: "weixin", bot: new WeixinBot(
+        weixinAccount!, new Set(config.weixin.allowedUserIds), agent, store, logger,
+      ) }] : []),
+    ];
     let shutdownPromise: Promise<void> | undefined;
     const shutdown = (reason: string): Promise<void> => shutdownPromise ??= (async () => {
       logger.info({ reason }, "shutting down");
-      try {
-        await telegram.stop();
-      } catch (err) {
-        logger.error({ err }, "failed to stop telegram");
+      const results = await Promise.allSettled([
+        ...channels.map(({ bot }) => bot.stop()),
+        agent.stopAll(),
+      ]);
+      for (const result of results) {
+        if (result.status !== "rejected") continue;
+        logger.error({ err: result.reason }, "failed to stop messaging service");
         process.exitCode = 1;
       }
       try {
@@ -66,15 +72,18 @@ async function run(): Promise<void> {
     process.once("SIGTERM", onSigterm);
 
     try {
-      await telegram.start(() => {
-        logger.info(
-          {
-            configPath: config.configPath,
-            dataDir: config.dataDir,
-          },
-          "Prax started",
-        );
-      });
+      const results = await Promise.allSettled(channels.map(async ({ name, bot }) => {
+        try {
+          await bot.start(() => {
+            logger.info({ channel: name, configPath: config.configPath, dataDir: config.dataDir }, "Prax channel started");
+          });
+        } catch (err) {
+          logger.error({ err, channel: name }, "messaging channel stopped; other channels remain active");
+          throw err;
+        }
+      }));
+      const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (errors.length) throw new AggregateError(errors, "Messaging channels stopped with errors");
     } finally {
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);

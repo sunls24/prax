@@ -414,12 +414,19 @@ describe("Telegram message flow", () => {
     await receive(1, "first");
     await vi.waitFor(() => expect(agent.prompt).toHaveBeenCalledOnce());
     await receive(2, "second");
-    await adapter.stop();
+    await Promise.all([adapter.stop(), agent.stopAll()]);
     expect(agent.prompt).toHaveBeenCalledExactlyOnceWith({ channel: "telegram", accountId: "default", conversationId: "42" }, "first");
     expect(sentTexts()).toContain("任务已停止");
     expect(sentTexts().some((text) => text.includes("此任务尚未执行，已取消"))).toBe(true);
     await receive(3, "after shutdown");
     expect(agent.prompt).toHaveBeenCalledOnce();
+  });
+
+  it("stops only the Telegram transport without shutting down the shared agent", async () => {
+    const { adapter, agent } = await messageFixture();
+    await adapter.stop();
+    expect(agent.stopAll).not.toHaveBeenCalled();
+    await expect(agent.status({ channel: "weixin", accountId: "wx-bot", conversationId: "owner" })).resolves.toMatchObject({ running: false });
   });
 
   it("reports interrupted tasks without replay or affecting other accounts", async () => {

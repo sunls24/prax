@@ -33,6 +33,12 @@ export class StateStore {
         state TEXT NOT NULL CHECK (state IN ('queued', 'running')),
         PRIMARY KEY (channel, account_id, peer_id, message_id)
       );
+      CREATE TABLE IF NOT EXISTS channel_cursors (
+        channel TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        cursor TEXT NOT NULL,
+        PRIMARY KEY (channel, account_id)
+      );
     `);
   }
 
@@ -76,6 +82,19 @@ export class StateStore {
       SELECT peer_id AS conversationId, message_id AS messageId, state
       FROM unfinished_tasks WHERE channel = ? AND account_id = ? ORDER BY rowid
     `).all(channel, accountId) as unknown as UnfinishedTask[];
+  }
+
+  getCursor(channel: string, accountId: string): string {
+    const row = this.database.prepare("SELECT cursor FROM channel_cursors WHERE channel = ? AND account_id = ?")
+      .get(channel, accountId) as { cursor: string } | undefined;
+    return row?.cursor ?? "";
+  }
+
+  saveCursor(channel: string, accountId: string, cursor: string): void {
+    this.database.prepare(`
+      INSERT INTO channel_cursors (channel, account_id, cursor) VALUES (?, ?, ?)
+      ON CONFLICT (channel, account_id) DO UPDATE SET cursor = excluded.cursor
+    `).run(channel, accountId, cursor);
   }
 
   close(): void {

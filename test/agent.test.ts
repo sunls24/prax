@@ -92,7 +92,7 @@ describe("PraxAgent with the Pi SDK", () => {
     const systemPrompt = JSON.stringify(requests[0]?.messages.filter((message) => message.role === "system"));
     expect(systemPrompt).toContain("You are an expert coding assistant operating inside pi");
     expect(systemPrompt).toContain("Use edit for precise changes");
-    expect(systemPrompt).toContain("你是 Prax，通过 Telegram");
+    expect(systemPrompt).toContain("你是 Prax，通过消息渠道");
     expect(systemPrompt).not.toContain("unexpected-system-prompt");
     expect(requests[0]?.tools.map((tool) => tool.function.name).sort()).toEqual(["bash", "edit", "read", "web_fetch", "write"]);
     const workspacePath = agent.agent.getWorkspacePath(identity);

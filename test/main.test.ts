@@ -5,10 +5,13 @@ import { HttpError } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const service = vi.hoisted(() => ({
-  createAgent: vi.fn(), disposeAgent: vi.fn(), start: vi.fn(), stopChannel: vi.fn(), closeStore: vi.fn(),
+  createAgent: vi.fn(), disposeAgent: vi.fn(), stopAll: vi.fn(), start: vi.fn(), stopChannel: vi.fn(), closeStore: vi.fn(),
+  startWeixin: vi.fn(), stopWeixin: vi.fn(), loadWeixinAccount: vi.fn(),
 }));
 vi.mock("../src/agent.js", () => ({ PraxAgent: { create: service.createAgent } }));
 vi.mock("../src/telegram.js", () => ({ TelegramBot: class { start = service.start; stop = service.stopChannel; } }));
+vi.mock("../src/weixin.js", () => ({ WeixinBot: class { start = service.startWeixin; stop = service.stopWeixin; } }));
+vi.mock("../src/weixin-api.js", () => ({ loadWeixinAccount: service.loadWeixinAccount }));
 vi.mock("../src/state.js", () => ({ StateStore: class { close = service.closeStore; } }));
 let root: string;
 let previousExitCode: typeof process.exitCode;
@@ -28,8 +31,10 @@ beforeEach(async () => {
   vi.stubEnv("TELEGRAM_BOT_TOKEN_FILE", undefined);
   vi.spyOn(console, "error").mockImplementation(() => {});
   await writeFile(join(root, "config.json"), JSON.stringify({ agent: { provider: "custom-api", model: "test" }, telegram: { allowedUserIds: ["42"] } }));
-  service.createAgent.mockResolvedValue({ dispose: service.disposeAgent });
+  service.createAgent.mockResolvedValue({ dispose: service.disposeAgent, stopAll: service.stopAll });
   service.start.mockRejectedValue(new Error("polling failed"));
+  service.startWeixin.mockResolvedValue(undefined);
+  service.loadWeixinAccount.mockResolvedValue({ bot_token: "fake-weixin-token", ilink_bot_id: "wx-bot", baseurl: "https://weixin.test" });
 });
 afterEach(async () => {
   process.exitCode = previousExitCode;
@@ -63,8 +68,48 @@ describe("service lifecycle", () => {
     finishStop();
     await vi.waitFor(() => expect(service.closeStore).toHaveBeenCalledOnce());
     expect(service.stopChannel).toHaveBeenCalledOnce();
+    expect(service.stopAll).toHaveBeenCalledOnce();
     expect(service.disposeAgent).toHaveBeenCalledOnce();
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it("runs Weixin without requiring a Telegram token", async () => {
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", undefined);
+    await writeFile(join(root, "config.json"), JSON.stringify({
+      agent: { provider: "custom-api", model: "test" }, weixin: { allowedUserIds: ["owner@im.wechat"] },
+    }));
+    await import("../src/main.js");
+    await vi.waitFor(() => expect(service.closeStore).toHaveBeenCalledOnce());
+    expect(service.startWeixin).toHaveBeenCalledOnce();
+    expect(service.start).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("keeps Telegram running after Weixin fails and waits for every channel during shutdown", async () => {
+    await writeFile(join(root, "config.json"), JSON.stringify({
+      agent: { provider: "custom-api", model: "test" },
+      telegram: { allowedUserIds: ["42"] }, weixin: { allowedUserIds: ["owner@im.wechat"] },
+    }));
+    let finishTelegram!: () => void;
+    let finishAgent!: () => void;
+    service.start.mockImplementationOnce(() => new Promise<void>((resolve) => { finishTelegram = resolve; }));
+    service.stopChannel.mockImplementationOnce(async () => finishTelegram());
+    service.stopAll.mockImplementationOnce(() => new Promise<void>((resolve) => { finishAgent = resolve; }));
+    service.startWeixin.mockRejectedValueOnce(new Error("Weixin credentials rejected"));
+    await import("../src/main.js");
+    await vi.waitFor(() => expect(service.startWeixin).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(service.stopChannel).not.toHaveBeenCalled();
+    expect(service.stopAll).not.toHaveBeenCalled();
+    expect(service.closeStore).not.toHaveBeenCalled();
+    process.listeners("SIGTERM").at(-1)!("SIGTERM");
+    await vi.waitFor(() => expect(finishAgent).toBeTypeOf("function"));
+    expect(service.stopWeixin).toHaveBeenCalledOnce();
+    expect(service.closeStore).not.toHaveBeenCalled();
+    finishAgent();
+    await vi.waitFor(() => expect(service.closeStore).toHaveBeenCalledOnce());
+    expect(service.disposeAgent).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
   });
 
   it("cleans up after a polling failure and redacts tokens without losing the cause", async () => {
