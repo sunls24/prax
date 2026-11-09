@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpError } from "grammy";
@@ -83,6 +83,22 @@ describe("service lifecycle", () => {
     expect(service.startWeixin).toHaveBeenCalledOnce();
     expect(service.start).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it("starts the other Telegram bots when one account is missing its credentials", async () => {
+    await mkdir(join(root, "secrets"));
+    for (const id of ["102", "103"]) await writeFile(join(root, "secrets", `telegram-${id}.token`), `${id}:test-token`);
+    await writeFile(join(root, "config.json"), JSON.stringify({
+      agent: { provider: "custom-api", model: "test" },
+      accounts: ["101", "102", "103"].map((botId) => ({ channel: "telegram", botId, allowedUserIds: ["42"] })),
+    }));
+    service.start.mockResolvedValue(undefined);
+    await import("../src/main.js");
+    await vi.waitFor(() => expect(process.exitCode).toBe(1));
+    expect(service.start).toHaveBeenCalledTimes(2);
+    expect(service.stopChannel).toHaveBeenCalledTimes(2);
+    expect(service.closeStore).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.error).mock.calls.flat().join(" ")).toContain("telegram-101.token");
   });
 
   it("keeps Telegram running after Weixin fails and waits for every channel during shutdown", async () => {

@@ -4,7 +4,7 @@
 
 ## 启动
 
-准备模型 API key。配置向导支持微信、Telegram 或同时启用：微信通过扫码登录；Telegram 需要 bot token 和数字用户 ID。模型接口可选 Responses / Chat Completions，请按服务商文档选择；启用网页搜索时还需要 Tavily key。
+准备模型 API Key。首次运行配置向导时，填写模型信息并添加至少一个消息账号。微信需要扫码，Telegram 需要 Bot Token 和数字用户 ID。
 
 ```bash
 mkdir -p data
@@ -22,49 +22,30 @@ npm run config
 npm run dev
 ```
 
-再次运行配置命令即可修改设置，渠道默认沿用已有选择。已有密钥留空保留，微信默认使用已保存的凭据；停用渠道不会删除凭据、会话或工作区。修改后重启服务生效。
+再次运行配置命令，可单独修改消息账号、模型或网页搜索。网页搜索默认关闭，开启时需要 Tavily API Key。配置、凭据和会话默认保存在 `./data`（Compose 中为 `/data`）。`PRAX_DATA_DIR` 设置数据目录，`PRAX_CONFIG` 指定配置文件。
 
-保存后的检查只验证本地配置，不代表网络连接可用。启动服务后，发送 `/status` 检查渠道收发，再发送一句话检查模型回复。关闭网页搜索不影响网页抓取。
+## 消息账号
 
-配置、密钥、工作区和会话默认保存在 `./data`（Compose 中为 `/data`）。`PRAX_DATA_DIR` 设置数据目录，`PRAX_CONFIG` 指定配置文件。
+在「消息账号」中选择「添加账号」，可添加多个微信和 Telegram Bot。每个账号独立设置授权用户，多个 ID 用逗号分隔。
 
-## 微信渠道
+- **微信**：扫描终端二维码并按手机提示确认。授权用户填 iLink 用户 ID，扫码返回用户 ID 时会自动填入。取消配置不会撤销微信侧的绑定。
+- **Telegram**：粘贴从 @BotFather 获取的 Bot Token。向导会确认 Bot 身份，再询问授权用户的数字 ID。
 
-运行配置命令，在“消息渠道”选择微信或同时启用两种渠道。首次配置时扫描终端二维码，并按手机提示确认；需要验证码时，在终端输入手机微信显示的数字。二维码过期可重新获取，也可按 Ctrl+C 取消。
+选择已有账号可修改授权用户、更新凭据或停用。停用会保留凭据和历史。保存后重启服务，再分别发送 `/status` 测试收发。旧的 `telegram`、`weixin` 配置和凭据可继续使用。
 
-登录完成后，首次配置默认以扫码用户作为授权用户；已有白名单在重新登录时默认保留。摘要会展示微信账号和授权用户，凭据仅在确认保存后写入 `secrets/weixin-account.json`，权限为 `600`。扫码确认已经执行远端登录，取消本地保存不会撤销该登录。
-
-重新登录时选择“重新扫码登录”。验证码尝试次数过多、登录失败或超时会停止配置，不覆盖已有本地凭据。
-
-也可以手动配置，登录凭据格式参考[腾讯微信后端协议](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol_zh_CN.md#二维码登录)。
-
-在 `data/config.json` 中添加 `weixin`，白名单填写 iLink 返回的用户 ID（如 `ilink_user_id`），不是微信号或昵称：
+手动添加时，在 `config.json` 的 `accounts` 列表中写入账号：
 
 ```json
 {
   "agent": { "provider": "custom-api", "model": "your-model" },
-  "weixin": { "allowedUserIds": ["your-user-id@im.wechat"] }
+  "accounts": [
+    { "channel": "telegram", "botId": "123456", "allowedUserIds": ["42"] },
+    { "channel": "weixin", "botId": "your-bot-id", "allowedUserIds": ["your-user-id@im.wechat"] }
+  ]
 }
 ```
 
-同时使用 Telegram 时保留原有 `telegram` 字段；删除该字段即可仅运行微信，此时不需要 Telegram token。模型的 `models.json` 和 `secrets/model-api-key` 沿用现有配置。
-
-将登录凭据写入 `data/secrets/weixin-account.json`，服务地址使用登录响应中的 `baseurl`：
-
-```json
-{
-  "bot_token": "your-bot-token",
-  "ilink_bot_id": "your-bot-id",
-  "baseurl": "https://ilinkai.weixin.qq.com"
-}
-```
-
-设置凭据文件权限后重启服务：
-
-```bash
-chmod 600 data/secrets/weixin-account.json
-docker compose up -d --build
-```
+Telegram 的 Token 存到 `secrets/telegram-<botId>.token`。微信凭据存到 `secrets/wx-<botId 的 UTF-8 十六进制>.json`，内容为登录返回的 `bot_token`、`ilink_bot_id` 和 `baseurl`。`botId` 填平台返回的 Bot ID，凭据文件权限设为 `600`。
 
 微信支持下方相同命令，回复为文本，长回复分段发送。图片、语音、文件及群聊暂不支持。轮询游标按账号保存；短暂收消息故障自动退避重试，凭据被拒绝后该渠道停止轮询并记录错误，其他渠道继续运行。更新凭据后需要重启服务。
 

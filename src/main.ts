@@ -3,7 +3,7 @@ import { inspect } from "node:util";
 import pino from "pino";
 import { PraxAgent } from "./agent.js";
 import { TelegramBot } from "./telegram.js";
-import { loadConfig } from "./config.js";
+import { accountCredentialPath, loadConfig, telegramSessionId } from "./config.js";
 import { TavilySearchProvider } from "./web.js";
 import { readSecret, redactTelegramToken } from "./secrets.js";
 import { StateStore } from "./state.js";
@@ -21,10 +21,8 @@ async function run(): Promise<void> {
     },
   });
   const config = await loadConfig();
-  const [modelApiKey, telegramToken, weixinAccount, tavilyApiKey] = await Promise.all([
+  const [modelApiKey, tavilyApiKey] = await Promise.all([
     readSecret("PRAX_MODEL_API_KEY", true, resolve(config.secretsDir, "model-api-key")),
-    config.telegram ? readSecret("TELEGRAM_BOT_TOKEN", true, resolve(config.secretsDir, "telegram-token")) : undefined,
-    config.weixin ? loadWeixinAccount(resolve(config.secretsDir, "weixin-account.json")) : undefined,
     config.webSearch.enabled ? readSecret("TAVILY_API_KEY", true, resolve(config.secretsDir, "tavily-api-key")) : undefined,
   ]);
   const searchProvider = tavilyApiKey
@@ -39,19 +37,13 @@ async function run(): Promise<void> {
       ...(searchProvider ? { searchProvider } : {}),
       logger,
     });
-    const channels = [
-      ...(config.telegram ? [{ name: "telegram", bot: new TelegramBot(
-        telegramToken!, config.telegram.accountId, new Set(config.telegram.allowedUserIds), agent, store, logger,
-      ) }] : []),
-      ...(config.weixin ? [{ name: "weixin", bot: new WeixinBot(
-        weixinAccount!, new Set(config.weixin.allowedUserIds), agent, store, logger,
-      ) }] : []),
-    ];
+    const bots: (TelegramBot | WeixinBot)[] = [];
+    const botIds = new Set<string>();
     let shutdownPromise: Promise<void> | undefined;
     const shutdown = (reason: string): Promise<void> => shutdownPromise ??= (async () => {
       logger.info({ reason }, "shutting down");
       const results = await Promise.allSettled([
-        ...channels.map(({ bot }) => bot.stop()),
+        ...bots.map((bot) => bot.stop()),
         agent.stopAll(),
       ]);
       for (const result of results) {
@@ -72,13 +64,35 @@ async function run(): Promise<void> {
     process.once("SIGTERM", onSigterm);
 
     try {
-      const results = await Promise.allSettled(channels.map(async ({ name, bot }) => {
+      const results = await Promise.allSettled(config.accounts.filter((account) => account.enabled !== false).map(async (account) => {
+        const { channel, botId } = account;
+        const name = account.label ?? botId ?? ("legacy" in account ? account.accountId : undefined) ?? "default";
+        const checkBotId = (actual: string) => {
+          if (botId !== undefined && actual !== botId) throw new Error("Credentials belong to a different bot");
+          const key = `${channel}:${actual}`;
+          if (botIds.has(key)) throw new Error(`Duplicate bot: ${key}`);
+          botIds.add(key);
+        };
+        const onStart = () => logger.info({ channel, account: name }, "Prax account started");
         try {
-          await bot.start(() => {
-            logger.info({ channel: name, configPath: config.configPath, dataDir: config.dataDir }, "Prax channel started");
-          });
+          const path = accountCredentialPath(config.secretsDir, account);
+          const allowed = new Set(account.allowedUserIds);
+          if (channel === "telegram") {
+            const token = await readSecret("legacy" in account ? "TELEGRAM_BOT_TOKEN" : undefined, true, path);
+            if (shutdownPromise) return;
+            const bot = new TelegramBot(token, telegramSessionId(account), allowed, agent, store, logger);
+            bots.push(bot);
+            await bot.start(onStart, checkBotId);
+          } else {
+            const credentials = await loadWeixinAccount(path);
+            if (shutdownPromise) return;
+            checkBotId(credentials.ilink_bot_id);
+            const bot = new WeixinBot(credentials, allowed, agent, store, logger);
+            bots.push(bot);
+            await bot.start(onStart);
+          }
         } catch (err) {
-          logger.error({ err, channel: name }, "messaging channel stopped; other channels remain active");
+          logger.error({ err, channel, account: name }, "messaging account stopped");
           throw err;
         }
       }));

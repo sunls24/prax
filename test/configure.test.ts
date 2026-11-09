@@ -1,9 +1,10 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { Api, GrammyError } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configure } from "../src/configure.js";
-import { loadConfig } from "../src/config.js";
+import { accountCredentialPath, loadConfig, telegramSessionId } from "../src/config.js";
 import { loginWeixin } from "../src/weixin-login.js";
 
 vi.mock("../src/weixin-login.js", () => ({ loginWeixin: vi.fn() }));
@@ -11,7 +12,7 @@ const weixinAccount = { bot_token: "synthetic-weixin-token", ilink_bot_id: "bot@
 
 const terminal = vi.hoisted(() => ({
   write: vi.fn(),
-  answers: [] as (string | boolean | Error)[],
+  answers: [] as (string | number | boolean | Error)[],
   prompts: [] as { kind: string; config: { message: string; default?: string | boolean; mask?: string | boolean; toggleMask?: boolean } }[],
 }));
 vi.mock("node:process", () => ({ stdin: { isTTY: true }, stdout: { isTTY: true, write: terminal.write } }));
@@ -57,6 +58,7 @@ beforeEach(async () => {
   terminal.answers = [];
   terminal.prompts = [];
   terminal.write.mockClear();
+  vi.spyOn(Api.prototype, "getMe").mockResolvedValue({ id: 123, username: "prax_bot", is_bot: true, first_name: "Prax" } as Awaited<ReturnType<Api["getMe"]>>);
   vi.mocked(loginWeixin).mockReset();
   vi.mocked(loginWeixin).mockResolvedValue({ account: weixinAccount, userId: "owner@im.wechat", reused: false });
 });
@@ -98,190 +100,183 @@ async function denyDirectoryWrites(directory: string): Promise<Error> {
 }
 
 describe("configure", () => {
-  it("preserves advanced settings, all owners, other models and credentials when keeping current values", async () => {
-    const { settings, definition } = await existingConfiguration();
-    await denyDirectoryWrites(join(root, "runtime", "secrets"));
-    terminal.answers = Array(11).fill("");
+  const initialModel = ["", "openai-completions", "local-model", false, "64000", "4096", "model-key"];
+  const configPath = () => join(root, "config.json");
 
-    await configure();
-
-    expect(JSON.parse(await readFile(join(root, "config.json"), "utf8"))).toEqual(settings);
-    const models = JSON.parse(await readFile(join(root, "runtime", "models.json"), "utf8"));
-    expect(models.providers["custom-api"].models).toEqual([definition, { id: "other-model" }]);
-    expect((await loadConfig(join(root, "config.json"))).modelsPath).toBe(join(root, "runtime", "models.json"));
-    expect(await readFile(join(root, "runtime", "secrets", "model-api-key"), "utf8")).toBe("existing-key");
-    expect(output()).toContain("上下文：64000 token");
-    expect(output()).toContain("Telegram 用户：42, 43");
-    expect(output()).toContain("本地：npm run dev");
-    expect(output()).not.toContain("模型 API Key：保留现有");
-    expect(output()).not.toContain("保存后将停用");
-    expect(output()).toContain("Telegram 账号标识：bot-a");
-  });
-
-  it("requires explicit capabilities for an unknown model", async () => {
-    terminal.answers = ["", "openai-completions", "local-model", true, "65536", "4096", "high", "model-key", "telegram", "bot-token", "42", false, true];
-    await configure();
-    const models = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
-    expect(models.providers["custom-api"].models[0]).toMatchObject({ id: "local-model", reasoning: true, contextWindow: 65536, maxTokens: 4096 });
-    expect((await loadConfig(join(root, "config.json"))).agent.thinkingLevel).toBe("high");
-    expect(output()).not.toContain("Telegram 账号标识：default");
-  });
-
-  it("does not persist environment credentials on first setup", async () => {
-    const secretsDirectory = join(root, "secrets");
-    const tokenPath = join(secretsDirectory, "telegram-token");
-    await mkdir(secretsDirectory);
-    await writeFile(tokenPath, "env-bot-token");
-    await denyDirectoryWrites(secretsDirectory);
-    vi.stubEnv("PRAX_MODEL_API_KEY", "env-model-key");
-    vi.stubEnv("TELEGRAM_BOT_TOKEN_FILE", tokenPath);
-    terminal.answers = ["", "", "gpt-5.4", "", "", "telegram", "42", false, true];
-
-    await configure();
-
-    const files = await readdir(root);
-    expect(files).toContain("config.json");
-    expect(files).toContain("models.json");
-    expect(files).toContain("secrets");
-    expect(await readdir(secretsDirectory)).toEqual(["telegram-token"]);
-    expect(await readFile(tokenPath, "utf8")).toBe("env-bot-token");
-    expect(output()).not.toContain("env-model-key");
-    expect(output()).not.toContain("env-bot-token");
-    expect(output()).toContain("模型 API Key：使用环境变量");
-  });
-
-  it("retries invalid addresses, capacities, secrets and user IDs without losing prior answers", async () => {
-    terminal.answers = [
-      "not-a-url", "ftp://api.example.test", "https://api.example.test/v1", "openai-completions", "local-model", false,
-      "128K", "0", "-1", "65536", "1.5", "4096", "", " model-key ", "telegram", "bot-token", "@username", "42", true, "", "tavily-key", true,
-    ];
-
-    await configure();
-
-    const config = await loadConfig(join(root, "config.json"));
-    expect(config.telegram.allowedUserIds).toEqual(["42"]);
-    expect(config.webSearch.enabled).toBe(true);
-    expect(await readFile(join(config.secretsDir, "model-api-key"), "utf8")).toBe("model-key");
-    expect(await readFile(join(config.secretsDir, "tavily-api-key"), "utf8")).toBe("tavily-key");
-    expect(terminal.prompts.filter((prompt) => prompt.config.message === "API 基础地址")).toHaveLength(1);
-    expect(output()).toContain("API 地址必须使用 HTTP 或 HTTPS。");
-    expect(output()).toContain("请输入 token 数量的正整数");
-    expect(output()).toContain("请输入你本人的数字用户 ID");
-    expect(terminal.answers).toEqual([]);
-  });
-
-  it("leaves existing files unchanged and does not save login credentials when declining to save", async () => {
-    await existingConfiguration();
-    const files = ["config.json", "runtime/models.json", "runtime/secrets/model-api-key", "runtime/secrets/telegram-token"];
-    const before = await Promise.all(files.map((file) => readFile(join(root, file), "utf8")));
-    terminal.answers = ["https://new-api.example.test/v1", "", "", "", "", "new-key", "weixin", "", false, false];
-
-    await configure();
-
-    expect(await Promise.all(files.map((file) => readFile(join(root, file), "utf8")))).toEqual(before);
-    expect(await readdir(join(root, "runtime"))).toEqual(["models.json", "secrets"]);
-    expect(loginWeixin).toHaveBeenCalledOnce();
-    await expect(readFile(join(root, "runtime/secrets/weixin-account.json"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect(output()).toContain("已取消，配置未保存");
-  });
-
-  it("checks file writes in existing directories and cleans up after a failed check", async () => {
-    const error = Object.assign(new Error("permission denied"), { code: "EACCES" });
-    vi.mocked(writeFile).mockRejectedValueOnce(error);
-
-    await expect(configure()).rejects.toMatchObject({
-      message: expect.stringContaining(root),
-      cause: error,
-    });
-
-    expect(terminal.prompts).toEqual([]);
-    expect(await readdir(root)).toEqual([]);
-  });
-
-  it("sets up Weixin alone without requesting Telegram credentials", async () => {
-    terminal.answers = ["", "openai-completions", "local-model", false, "64000", "4096", "model-key", "weixin", "", false, true];
-    await configure();
-    const config = await loadConfig(join(root, "config.json"));
-    expect(config.telegram).toBeUndefined();
-    expect(config.weixin).toEqual({ allowedUserIds: ["owner@im.wechat"] });
-    const accountPath = join(config.secretsDir, "weixin-account.json");
-    expect(JSON.parse(await readFile(accountPath, "utf8"))).toEqual(weixinAccount);
-    expect((await stat(accountPath)).mode & 0o777).toBe(0o600);
-    expect(terminal.prompts.some(({ config }) => config.message.includes("Telegram"))).toBe(false);
-    expect(output()).toContain("微信账号：bot@im.bot");
-    expect(output()).toContain("渠道收发和模型回复尚待验证");
-    expect(output()).not.toContain(weixinAccount.bot_token);
-  });
-
-  it("adds Weixin while preserving Telegram owners and credentials", async () => {
+  async function existingWeixin() {
     const { settings } = await existingConfiguration();
-    terminal.answers = [...Array(6).fill(""), "both", "", "", "", false, true];
-    await configure();
-    const config = await loadConfig(join(root, "config.json"));
-    expect(config.telegram).toEqual(settings.telegram);
-    expect(config.weixin?.allowedUserIds).toEqual(["owner@im.wechat"]);
-    expect(await readFile(join(config.secretsDir, "telegram-token"), "utf8")).toBe("existing-key");
-    expect(output()).toContain("渠道：微信、Telegram");
-  });
-
-  async function existingWeixin(telegram = false) {
-    const { settings } = await existingConfiguration();
-    const { telegram: previousTelegram, ...rest } = settings;
-    const updated = { ...rest, ...(telegram ? { telegram: previousTelegram } : {}), weixin: { allowedUserIds: ["old@im.wechat", "second@im.wechat"] } };
-    await writeFile(join(root, "config.json"), JSON.stringify(updated));
+    const { telegram: _telegram, ...rest } = settings;
+    const updated = { ...rest, weixin: { allowedUserIds: ["old@im.wechat", "second@im.wechat"] } };
+    await writeFile(configPath(), JSON.stringify(updated));
     const path = join(root, "runtime/secrets/weixin-account.json");
     await writeFile(path, JSON.stringify(weixinAccount));
     return { settings: updated, path };
   }
 
-  it("keeps Weixin-only configuration and its credentials by default", async () => {
-    const { settings, path } = await existingWeixin();
-    const before = await readFile(path, "utf8");
-    await denyDirectoryWrites(join(root, "runtime/secrets"));
-    terminal.answers = Array(11).fill("");
+  it("exits without rewriting unchanged configuration or prompting for secrets", async () => {
+    await existingConfiguration();
+    const before = await readFile(configPath(), "utf8");
+    await denyDirectoryWrites(join(root, "runtime", "secrets"));
+    terminal.answers = [""];
     await configure();
-    expect(JSON.parse(await readFile(join(root, "config.json"), "utf8"))).toEqual(settings);
-    expect(await readFile(path, "utf8")).toBe(before);
-    expect(loginWeixin).not.toHaveBeenCalled();
-    expect(output()).not.toContain("不在原授权列表");
-    expect(terminal.prompts.find(({ config }) => config.message === "选择要启用的渠道")?.config.default).toBe("weixin");
+    expect(await readFile(configPath(), "utf8")).toBe(before);
+    expect(terminal.prompts.map(({ config }) => config.message)).toEqual(["配置项目"]);
   });
 
-  it("preserves the allowlist on re-login, even when a different user scans", async () => {
-    const { settings, path } = await existingWeixin();
-    terminal.answers = [...Array(7).fill(""), "login", "", false, true];
+  it("collects missing model parameters and sets up Weixin without Telegram or search prompts", async () => {
+    terminal.answers = [...initialModel, "weixin", "", -1, true];
     await configure();
-    expect(loginWeixin).toHaveBeenCalledExactlyOnceWith(weixinAccount);
-    expect((await loadConfig(join(root, "config.json"))).weixin).toEqual(settings.weixin);
+    const config = await loadConfig(configPath());
+    const [account] = config.accounts;
+    expect(config.accounts).toEqual([{ channel: "weixin", botId: weixinAccount.ilink_bot_id, allowedUserIds: ["owner@im.wechat"] }]);
+    const path = accountCredentialPath(config.secretsDir, account!);
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(weixinAccount);
-    expect(output()).toContain("扫码用户 owner@im.wechat 不在原授权列表中");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(config.webSearch.enabled).toBe(false);
+    expect(vi.mocked(Api.prototype.getMe)).not.toHaveBeenCalled();
+    expect(output()).not.toContain(weixinAccount.bot_token);
+    const models = JSON.parse(await readFile(config.modelsPath, "utf8"));
+    expect(models.providers["custom-api"].models[0]).toMatchObject({ reasoning: false, contextWindow: 64000, maxTokens: 4096 });
   });
 
-  it("disables Weixin without deleting its credentials or workspace", async () => {
-    const { path } = await existingWeixin(true);
-    const before = await readFile(path, "utf8");
-    await mkdir(join(root, "runtime/workspace"));
-    await writeFile(join(root, "runtime/workspace/keep"), "keep");
-    terminal.answers = [...Array(6).fill(""), "telegram", "", "", false, true];
+  it("uses environment credentials on first setup and adopts known model parameters", async () => {
+    const secretsDirectory = join(root, "secrets");
+    const tokenPath = join(secretsDirectory, "telegram-token");
+    await mkdir(secretsDirectory);
+    await writeFile(tokenPath, "123:env-token");
+    await denyDirectoryWrites(secretsDirectory);
+    vi.stubEnv("PRAX_MODEL_API_KEY", "env-model-key");
+    vi.stubEnv("TELEGRAM_BOT_TOKEN_FILE", tokenPath);
+    terminal.answers = ["", "", "gpt-5.4", "telegram", "", "42, 43", -1, true];
     await configure();
-    expect((await loadConfig(join(root, "config.json"))).weixin).toBeUndefined();
-    expect(await readFile(path, "utf8")).toBe(before);
-    expect(await readFile(join(root, "runtime/workspace/keep"), "utf8")).toBe("keep");
-    expect(loginWeixin).not.toHaveBeenCalled();
-    expect(output()).toContain("保存后将停用微信，凭据和历史保留");
+    const config = await loadConfig(configPath());
+    expect(config.accounts[0]).toMatchObject({ legacy: true, botId: "123", allowedUserIds: ["42", "43"] });
+    expect(await readdir(secretsDirectory)).toEqual(["telegram-token"]);
+    expect(terminal.prompts.every(({ kind }) => kind !== "password")).toBe(true);
+    expect(output()).not.toContain("123:env-token");
   });
 
-  it.each(["ExitPromptError", "Error"])("does not save on login failure or cancellation (%s)", async (name) => {
+  it("adds the first Telegram bot to an existing Weixin setup using an environment token without saving it", async () => {
+    const { settings } = await existingWeixin();
+    const directory = join(root, "runtime/secrets");
+    const before = await readdir(directory);
+    await denyDirectoryWrites(directory);
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "123:env-token");
+    terminal.answers = ["accounts", -2, "telegram", "", "42", -1, "save", true];
+    await configure();
+    const config = await loadConfig(configPath());
+    expect(config.accounts).toMatchObject([
+      { channel: "telegram", botId: "123", legacy: true, allowedUserIds: ["42"] },
+      { channel: "weixin", ...settings.weixin },
+    ]);
+    expect(await readdir(directory)).toEqual(before);
+    expect(terminal.prompts.some(({ kind }) => kind === "password")).toBe(false);
+  });
+
+  it("recovers from a rejected Telegram token and adds a second bot without changing existing settings", async () => {
+    const { settings } = await existingConfiguration();
+    const modelsPath = join(root, "runtime", "models.json");
+    const models = await readFile(modelsPath, "utf8");
+    vi.mocked(Api.prototype.getMe).mockRejectedValueOnce(
+      new GrammyError("getMe failed", { ok: false, error_code: 401, description: "Unauthorized" }, "getMe", {}),
+    );
+    terminal.answers = ["accounts", -2, "telegram", "123:rejected-token", -2, "telegram", "123:new-token", "@name", "99, 100, 99", -1, "save", true];
+    await configure();
+    const config = await loadConfig(configPath());
+    expect(config.accounts).toHaveLength(2);
+    expect(telegramSessionId(config.accounts[0]!)).toBe("bot-a");
+    expect(config.accounts[0]?.allowedUserIds).toEqual(["42", "43"]);
+    expect(config.accounts[1]).toEqual({ channel: "telegram", botId: "123", label: "@prax_bot", allowedUserIds: ["99", "100"] });
+    expect(await readFile(accountCredentialPath(config.secretsDir, config.accounts[1]!), "utf8")).toBe("123:new-token");
+    expect(await readFile(join(config.secretsDir, "telegram-token"), "utf8")).toBe("existing-key");
+    expect(await readFile(modelsPath, "utf8")).toBe(models);
+    expect(JSON.parse(await readFile(configPath(), "utf8")).agent).toEqual(settings.agent);
+    expect(terminal.prompts.some(({ config }) => config.message === "模型 ID")).toBe(false);
+    expect(output()).toContain("Telegram 拒绝了 Bot Token");
+    expect(output()).not.toContain("123:rejected-token");
+    expect(output()).not.toContain("123:new-token");
+  });
+
+  it("keeps pending changes after cancelling a scan and adds a second Weixin account on retry", async () => {
+    const { path, settings } = await existingWeixin();
+    const newAccount = { ...weixinAccount, ilink_bot_id: "other@im.bot", bot_token: "other-secret" };
+    vi.mocked(loginWeixin).mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ account: newAccount, userId: "other@im.wechat", reused: false });
+    terminal.answers = ["accounts", 0, "label", "原账号", -2, "weixin", -2, "weixin", "", -1, "save", true];
+    await configure();
+    const config = await loadConfig(configPath());
+    expect(config.accounts[0]).toMatchObject({ ...settings.weixin, label: "原账号" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(weixinAccount);
+    expect(config.accounts[1]?.allowedUserIds).toEqual(["other@im.wechat"]);
+    expect(JSON.parse(await readFile(accountCredentialPath(config.secretsDir, config.accounts[1]!), "utf8"))).toEqual(newAccount);
+  });
+
+  it("keeps the Weixin allowlist on credential refresh and rejects a different bot", async () => {
+    const { path, settings } = await existingWeixin();
+    const refreshed = { ...weixinAccount, bot_token: "new-secret" };
+    vi.mocked(loginWeixin)
+      .mockResolvedValueOnce({ account: { ...refreshed, ilink_bot_id: "different@im.bot" }, reused: false })
+      .mockResolvedValueOnce({ account: refreshed, userId: "different@im.wechat", reused: false });
+    terminal.answers = ["accounts", 0, "credentials", 0, "credentials", -1, "save", true];
+    await configure();
+    expect(loginWeixin).toHaveBeenNthCalledWith(2, weixinAccount);
+    expect(output()).toContain("扫到了另一个微信账号");
+    expect((await loadConfig(configPath())).accounts[0]?.allowedUserIds).toEqual(settings.weixin.allowedUserIds);
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(refreshed);
+  });
+
+  it("rejects a duplicate existing Telegram Bot before writing credentials", async () => {
+    await existingConfiguration();
+    await writeFile(join(root, "runtime/secrets/telegram-token"), "123:existing-token");
+    const before = await readFile(configPath(), "utf8");
+    terminal.answers = ["accounts", -2, "telegram", "123:other-token", -1, "save"];
+    await configure();
+    expect(await readFile(configPath(), "utf8")).toBe(before);
+    expect(output()).toContain("该账号已添加");
+  });
+
+  it("leaves files untouched when declining to save after scanning", async () => {
+    await existingConfiguration();
+    const before = await readFile(configPath(), "utf8");
+    terminal.answers = ["accounts", -2, "weixin", "", -1, "save", false];
+    await configure();
+    expect(loginWeixin).toHaveBeenCalledOnce();
+    expect(await readFile(configPath(), "utf8")).toBe(before);
+    expect(await readdir(join(root, "runtime/secrets"))).toEqual(["model-api-key", "telegram-token"]);
+  });
+
+  it("does not publish any files when staging a credential fails", async () => {
+    await existingConfiguration();
+    const before = await readFile(configPath(), "utf8");
+    const directory = join(root, "runtime/secrets");
+    const error = await denyDirectoryWrites(directory);
+    terminal.answers = ["accounts", -2, "weixin", "", -1, "save", true];
+    await expect(configure()).rejects.toBe(error);
+    expect(await readFile(configPath(), "utf8")).toBe(before);
+    expect(await readdir(directory)).toEqual(["model-api-key", "telegram-token"]);
+  });
+
+  it("can disable an account while preserving its credential and rejecting removal of the last enabled account", async () => {
+    const { path, settings } = await existingWeixin();
+    await writeFile(configPath(), JSON.stringify({ ...settings, telegram: { allowedUserIds: ["42"] } }));
+    const before = await readFile(path, "utf8");
+    terminal.answers = ["accounts", 1, "toggle", 0, "toggle", -1, "save", true];
+    await configure();
+    const config = await loadConfig(configPath());
+    expect(config.accounts.map(({ enabled }) => enabled)).toEqual([undefined, false]);
+    expect(await readFile(path, "utf8")).toBe(before);
+    expect(output()).toContain("请至少保留一个启用的账号");
+  });
+
+  it("does not save when Ctrl+C cancels login", async () => {
     const { path } = await existingWeixin();
-    const configBefore = await readFile(join(root, "config.json"), "utf8");
+    const configBefore = await readFile(configPath(), "utf8");
     const accountBefore = await readFile(path, "utf8");
-    vi.mocked(loginWeixin).mockRejectedValueOnce(Object.assign(new Error("login stopped"), { name }));
-    terminal.answers = [...Array(7).fill(""), "login"];
-    if (name === "ExitPromptError") {
-      await configure();
-      expect(process.exitCode).toBe(130);
-    } else await expect(configure()).rejects.toThrow("login stopped");
-    expect(await readFile(join(root, "config.json"), "utf8")).toBe(configBefore);
+    vi.mocked(loginWeixin).mockRejectedValueOnce(Object.assign(new Error("login stopped"), { name: "ExitPromptError" }));
+    terminal.answers = ["accounts", 0, "credentials"];
+    await configure();
+    expect(process.exitCode).toBe(130);
+    expect(await readFile(configPath(), "utf8")).toBe(configBefore);
     expect(await readFile(path, "utf8")).toBe(accountBefore);
   });
 });

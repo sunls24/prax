@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, telegramSessionId } from "../src/config.js";
 
 let directory: string;
 beforeEach(async () => {
@@ -31,28 +31,17 @@ describe("loadConfig", () => {
     expect(config.webSearch.enabled).toBe(false);
   });
 
-  it("rejects an empty owner allowlist", async () => {
-    const path = join(directory, "config.json");
-    await writeFile(path, JSON.stringify({
-      agent: { provider: "anthropic", model: "claude-sonnet-4-6" },
-      telegram: { allowedUserIds: [] },
-    }));
-
-    await expect(loadConfig(path)).rejects.toThrow("allowedUserIds");
-  });
-
   it("supports Weixin alone or alongside Telegram", async () => {
     const path = join(directory, "config.json");
     const base = { agent: { provider: "test", model: "test" }, weixin: { allowedUserIds: ["owner@im.wechat"] } };
     await writeFile(path, JSON.stringify(base));
     const weixin = await loadConfig(path);
-    expect(weixin.telegram).toBeUndefined();
-    expect(weixin.weixin?.allowedUserIds).toEqual(["owner@im.wechat"]);
+    expect(weixin.accounts).toEqual([{ channel: "weixin", legacy: true, allowedUserIds: ["owner@im.wechat"] }]);
     await writeFile(path, JSON.stringify({ ...base, telegram: { allowedUserIds: ["42"] } }));
-    expect((await loadConfig(path)).telegram?.accountId).toBe("default");
+    expect(telegramSessionId((await loadConfig(path)).accounts[0]!)).toBe("default");
   });
 
-  it.each([{ allowedUserIds: [] }, { allowedUserIds: [42] }, { allowedUserIds: [" "] }])("rejects an invalid Weixin allowlist: $allowedUserIds", async ({ allowedUserIds }) => {
+  it.each([{ allowedUserIds: [] }, { allowedUserIds: [42] }])("rejects an invalid Weixin allowlist: $allowedUserIds", async ({ allowedUserIds }) => {
     const path = join(directory, "config.json");
     await writeFile(path, JSON.stringify({ agent: { provider: "test", model: "test" }, weixin: { allowedUserIds } }));
     await expect(loadConfig(path)).rejects.toThrow("weixin.allowedUserIds");

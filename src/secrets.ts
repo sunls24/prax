@@ -4,11 +4,11 @@ export function redactTelegramToken(text: string): string {
   return text.replace(/\/bot\d+:[A-Za-z0-9_-]+/g, "/bot[REDACTED]");
 }
 
-export function readSecret(name: string, required: true, defaultFilePath?: string): Promise<string>;
-export function readSecret(name: string, required: false, defaultFilePath?: string): Promise<string | undefined>;
-export async function readSecret(name: string, required: boolean, defaultFilePath?: string): Promise<string | undefined> {
-  const filePath = process.env[`${name}_FILE`];
-  const directValue = process.env[name];
+export function readSecret(name: string | undefined, required: true, defaultFilePath?: string): Promise<string>;
+export function readSecret(name: string | undefined, required: false, defaultFilePath?: string): Promise<string | undefined>;
+export async function readSecret(name: string | undefined, required: boolean, defaultFilePath?: string): Promise<string | undefined> {
+  const filePath = name ? process.env[`${name}_FILE`] : undefined;
+  const directValue = name ? process.env[name] : undefined;
   let value = directValue;
   if (filePath) value = await readFile(filePath, "utf8");
   else if (!value && defaultFilePath) {
@@ -20,7 +20,7 @@ export async function readSecret(name: string, required: boolean, defaultFilePat
   const trimmed = value?.trim();
 
   if (!trimmed && required) {
-    throw new Error(`Missing secret: set ${name}_FILE or ${name}`);
+    throw new Error(name ? `Missing secret: set ${name}_FILE or ${name}` : `Missing secret: ${defaultFilePath}`);
   }
 
   return trimmed || undefined;

@@ -4,6 +4,24 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+interface AccountSettings {
+  allowedUserIds: string[];
+  enabled?: boolean;
+  botId?: string;
+  label?: string;
+}
+
+export interface MessagingAccount extends AccountSettings {
+  channel: "telegram" | "weixin";
+  botId: string;
+}
+
+export type ConfiguredAccount = MessagingAccount | (AccountSettings & {
+  channel: MessagingAccount["channel"];
+  legacy: true;
+  accountId?: string;
+});
+
 export interface ConfigInput {
   dataDir?: string;
   agent: {
@@ -12,13 +30,9 @@ export interface ConfigInput {
     thinkingLevel?: ThinkingLevel;
     timeoutSeconds?: number;
   };
-  telegram?: {
-    accountId?: string;
-    allowedUserIds: string[];
-  };
-  weixin?: {
-    allowedUserIds: string[];
-  };
+  telegram?: AccountSettings & { accountId?: string };
+  weixin?: AccountSettings;
+  accounts?: MessagingAccount[];
   webSearch?: {
     enabled: boolean;
     maxResults?: number;
@@ -46,8 +60,7 @@ export interface AppPaths {
 
 export type AppConfig = AppPaths & {
   agent: Required<ConfigInput["agent"]>;
-  telegram?: Required<NonNullable<ConfigInput["telegram"]>>;
-  weixin?: NonNullable<ConfigInput["weixin"]>;
+  accounts: ConfiguredAccount[];
   webSearch: Required<NonNullable<ConfigInput["webSearch"]>>;
   webFetch: Required<NonNullable<ConfigInput["webFetch"]>>;
 };
@@ -77,15 +90,9 @@ export function parseConfig(input: ConfigInput, path: string): AppConfig {
   if (!input?.agent?.provider || !input.agent.model) {
     throw new Error("Missing required fields: agent.provider and agent.model");
   }
-  if (!input.telegram && !input.weixin) {
+  const accounts = configuredAccounts(input);
+  if (!accounts.some((account) => account.enabled !== false)) {
     throw new Error("At least one messaging channel is required: telegram or weixin");
-  }
-  if (input.telegram && !input.telegram.allowedUserIds?.length) {
-    throw new Error("Missing required field: telegram.allowedUserIds");
-  }
-  if (input.weixin && (!Array.isArray(input.weixin.allowedUserIds) || !input.weixin.allowedUserIds.length
-    || input.weixin.allowedUserIds.some((id) => typeof id !== "string" || !id.trim()))) {
-    throw new Error("Missing or invalid field: weixin.allowedUserIds");
   }
   const webSearch = input.webSearch ?? { enabled: false };
   const webFetch = input.webFetch ?? { enabled: true };
@@ -98,11 +105,7 @@ export function parseConfig(input: ConfigInput, path: string): AppConfig {
       thinkingLevel: input.agent.thinkingLevel ?? "medium",
       timeoutSeconds: input.agent.timeoutSeconds ?? 300,
     },
-    ...(input.telegram ? { telegram: {
-      accountId: input.telegram.accountId ?? "default",
-      allowedUserIds: input.telegram.allowedUserIds,
-    } } : {}),
-    ...(input.weixin ? { weixin: { allowedUserIds: input.weixin.allowedUserIds } } : {}),
+    accounts,
     webSearch: {
       enabled: webSearch.enabled,
       maxResults: webSearch.maxResults ?? 5,
@@ -116,6 +119,66 @@ export function parseConfig(input: ConfigInput, path: string): AppConfig {
       maxRedirects: webFetch.maxRedirects ?? 3,
     },
   };
+}
+
+export function configuredAccounts(input: Partial<ConfigInput>): ConfiguredAccount[] {
+  const accounts: ConfiguredAccount[] = [];
+  if (input.telegram !== undefined) {
+    if (!input.telegram || typeof input.telegram !== "object") throw new Error("Invalid telegram config");
+    accounts.push({ ...input.telegram, channel: "telegram", legacy: true });
+  }
+  if (input.weixin !== undefined) {
+    if (!input.weixin || typeof input.weixin !== "object") throw new Error("Invalid weixin config");
+    accounts.push({ ...input.weixin, channel: "weixin", legacy: true });
+  }
+  if (input.accounts !== undefined && !Array.isArray(input.accounts)) throw new Error("Invalid accounts list");
+  for (const account of input.accounts ?? []) {
+    if (!account || !["telegram", "weixin"].includes(account.channel) || "legacy" in account) {
+      throw new Error("Invalid messaging account");
+    }
+    accounts.push(account);
+  }
+  const botIds = new Set<string>();
+  const telegramSessions = new Set<string>();
+  for (const account of accounts) {
+    const { channel, botId, allowedUserIds, label, enabled } = account;
+    const location = "legacy" in account ? channel : `accounts.${channel}`;
+    if (!Array.isArray(allowedUserIds) || !allowedUserIds.length
+      || allowedUserIds.some((id) => typeof id !== "string" || !id.trim())) {
+      throw new Error(`Missing or invalid field: ${location}.allowedUserIds`);
+    }
+    if (botId !== undefined || !("legacy" in account)) {
+      const valid = typeof botId === "string" && (channel === "telegram"
+        ? /^[1-9]\d{0,19}$/.test(botId) : /^[a-zA-Z0-9@._-]{1,120}$/.test(botId));
+      if (!valid) throw new Error(`Invalid botId: ${location}`);
+      const key = `${channel}:${botId}`;
+      if (botIds.has(key)) throw new Error(`Duplicate bot: ${key}`);
+      botIds.add(key);
+    }
+    if (label !== undefined && (typeof label !== "string" || !label.trim())) throw new Error(`Invalid label: ${location}`);
+    if (enabled !== undefined && typeof enabled !== "boolean") throw new Error(`Invalid enabled flag: ${location}`);
+    if (channel === "telegram") {
+      const session = telegramSessionId(account);
+      if (typeof session !== "string" || !session.trim()) throw new Error("Invalid telegram.accountId");
+      if (telegramSessions.has(session)) throw new Error(`Duplicate Telegram accountId: ${session}`);
+      telegramSessions.add(session);
+    }
+  }
+  return accounts;
+}
+
+export function telegramSessionId(account: ConfiguredAccount): string {
+  return "legacy" in account ? account.accountId ?? "default" : account.botId;
+}
+
+export function accountCredentialPath(secretsDir: string, account: ConfiguredAccount): string {
+  if ("legacy" in account) {
+    return resolve(secretsDir, account.channel === "telegram" ? "telegram-token" : "weixin-account.json");
+  }
+  if (account.channel === "telegram") return resolve(secretsDir, `telegram-${account.botId}.token`);
+  // Hex keeps different IDs distinct on case-insensitive filesystems.
+  const id = Buffer.from(account.botId).toString("hex");
+  return resolve(secretsDir, `wx-${id}.json`);
 }
 
 export async function loadConfig(path = configPath()): Promise<AppConfig> {

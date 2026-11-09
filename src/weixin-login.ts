@@ -46,8 +46,8 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
   account: WeixinAccount;
   userId?: string;
   reused: boolean;
-}> {
-  stdout.write("取消本地保存不会撤销已完成的微信登录。\n");
+} | undefined> {
+  stdout.write("取消配置不会撤销微信绑定。\n");
   const controller = new AbortController();
   const cancel = () => controller.abort();
   process.once("SIGINT", cancel);
@@ -75,7 +75,6 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
         try { status = await request(url, signal); }
         catch (error) {
           if (!signal.aborted && error instanceof Error && error.name === "TimeoutError") {
-            stdout.write("微信登录状态请求超时，继续等待。\n");
             continue;
           }
           throw error;
@@ -85,13 +84,13 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
             break;
           case "scaned":
             verifyCode = undefined;
-            if (!scanned) stdout.write("已扫码，请在微信确认。\n");
+            if (!scanned) stdout.write("已扫码，请在手机确认。\n");
             scanned = true;
             break;
           case "need_verifycode":
             verifyCode = (await input({
-              message: verifyCode ? "验证码不匹配，请重新输入手机微信显示的数字" : "输入手机微信显示的数字",
-              validate: (value) => /^\d+$/.test(value.trim()) || "请输入手机微信显示的数字。",
+              message: verifyCode ? "验证码错误，请重试" : "输入微信验证码",
+              validate: (value) => /^\d+$/.test(value.trim()) || "请输入微信验证码。",
             }, { signal })).trim();
             continue;
           case "scaned_but_redirect": {
@@ -101,7 +100,6 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
               throw new Error("微信登录重定向地址无效");
             }
             baseUrl = redirect.href;
-            stdout.write("正在连接微信登录服务。\n");
             break;
           }
           case "confirmed": {
@@ -109,7 +107,7 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
             if (status.ilink_user_id !== undefined && (typeof status.ilink_user_id !== "string" || !status.ilink_user_id.trim())) {
               throw new Error("微信登录返回的用户 ID 无效");
             }
-            stdout.write("微信登录成功，凭据待保存。\n");
+            stdout.write("微信登录成功。\n");
             return { account, reused: false, ...(typeof status.ilink_user_id === "string" ? { userId: status.ilink_user_id.trim() } : {}) };
           }
           case "binded_redirect":
@@ -120,9 +118,7 @@ export async function loginWeixin(existing?: WeixinAccount): Promise<{
             throw new Error("微信验证码尝试次数过多，已停止登录，请稍后重试。");
           case "expired":
             if (!await confirm({ message: "二维码已过期，重新获取？", default: true }, { signal })) {
-              const error = new Error("已取消微信登录");
-              error.name = "ExitPromptError";
-              throw error;
+              return undefined;
             }
             break;
           default:

@@ -66,7 +66,6 @@ describe("Weixin QR login", () => {
     expect(await loginWeixin()).toEqual({ account, reused: false });
     expect(JSON.parse(String(network.mock.calls[0]![1]?.body))).toEqual({ local_token_list: [] });
     expect(output().match(/已扫码/g)).toHaveLength(1);
-    expect(output()).toContain("请求超时");
   });
 
   it("refreshes an expired code with a fresh polling host and verification state", async () => {
@@ -81,10 +80,10 @@ describe("Weixin QR login", () => {
     expect(last.searchParams.has("verify_code")).toBe(false);
   });
 
-  it("cancels when refreshing is declined", async () => {
+  it("returns without credentials when refreshing is declined", async () => {
     responses(qr, { status: "expired" });
     ui.confirm.mockResolvedValueOnce(false);
-    await expect(loginWeixin()).rejects.toMatchObject({ name: "ExitPromptError" });
+    await expect(loginWeixin()).resolves.toBeUndefined();
     expect(network).toHaveBeenCalledTimes(2);
   });
 

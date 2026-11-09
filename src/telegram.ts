@@ -25,7 +25,7 @@ export class TelegramBot {
     this.bot = new Bot(token, { client: { timeoutSeconds: 60 } });
   }
 
-  async start(onStart?: () => void): Promise<void> {
+  async start(onStart?: () => void, checkBotId?: (id: string) => void): Promise<void> {
     this.bot.catch(({ error: cause }) => {
       if (cause instanceof GrammyError) {
         this.logger.error({ err: cause }, "telegram api error");
@@ -61,6 +61,8 @@ export class TelegramBot {
     const signal = this.stopController.signal as unknown as TelegramAbortSignal;
     try {
       await this.bot.init(signal);
+      if (signal.aborted) return;
+      checkBotId?.(String(this.bot.botInfo.id));
       await this.bot.api.setMyCommands([
         { command: "status", description: "查看版本和运行状态" },
         { command: "stop", description: "停止当前任务" },

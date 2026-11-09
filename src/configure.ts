@@ -1,13 +1,14 @@
-import { chmod, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { stdin, stdout } from "node:process";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { Api, GrammyError } from "grammy";
 import { confirm, input, password, select } from "@inquirer/prompts";
-import { configPath, createModelRuntime, loadConfig, parseConfig, readJsonFile, resolvePaths, type AppPaths, type ConfigInput, type ThinkingLevel } from "./config.js";
+import { accountCredentialPath, configPath, configuredAccounts, parseConfig, readJsonFile, resolvePaths, type AppPaths, type ConfigInput, type ConfiguredAccount, type ThinkingLevel } from "./config.js";
 import { readSecret } from "./secrets.js";
-import { parseWeixinAccount, type WeixinAccount } from "./weixin-api.js";
+import { parseWeixinAccount } from "./weixin-api.js";
 import { loginWeixin } from "./weixin-login.js";
 
 type ModelApi = "openai-responses" | "openai-completions";
@@ -20,17 +21,6 @@ type ModelDefinition = Record<string, unknown> & Partial<ModelParameters> & { id
 type ModelOverride = Record<string, unknown> & Partial<ModelParameters>;
 type ProviderDefinition = Record<string, unknown> & { baseUrl?: string; api?: string; models?: ModelDefinition[]; modelOverrides?: Record<string, ModelOverride> };
 type ModelsConfig = Record<string, unknown> & { providers?: Record<string, ProviderDefinition> };
-interface ConfigurationAnswers {
-  baseUrl: string;
-  api: ModelApi;
-  model: ModelDefinition;
-  parameters: ModelParameters;
-  thinkingLevel: ThinkingLevel;
-  channels: Pick<ConfigInput, "telegram" | "weixin">;
-  weixinAccount?: WeixinAccount;
-  webSearchEnabled: boolean;
-  secrets: { label: string; path: string; value: string | undefined; source: string }[];
-}
 const THINKING_LEVELS = [
   ["off", "关闭"],
   ["minimal", "最低"],
@@ -42,46 +32,12 @@ const THINKING_LEVELS = [
 ] as const satisfies ReadonlyArray<readonly [ThinkingLevel, string]>;
 type CurrentConfiguration = Awaited<ReturnType<typeof readConfiguration>>;
 
-async function atomicWrite(path: string, content: string): Promise<void> {
-  const temporaryPath = `${path}.tmp`;
-  await writeFile(temporaryPath, content, { mode: 0o600 });
-  await rename(temporaryPath, path);
-  await chmod(path, 0o600);
-}
-
-async function prepareDirectories(directories: string[]): Promise<void> {
-  for (const directory of new Set(directories)) {
-    try {
-      await mkdir(directory, { recursive: true });
-      const temporaryDirectory = await mkdtemp(resolve(directory, ".prax-config-check-"));
-      try {
-        await writeFile(resolve(temporaryDirectory, "check"), "prax config write check\n", { mode: 0o600 });
-      } finally {
-        await rm(temporaryDirectory, { recursive: true });
-      }
-    } catch (error) {
-      throw new Error(`无法写入配置目录 ${directory}，请检查目录权限或挂载是否可写。`, { cause: error });
-    }
-  }
-}
-
 async function readConfiguration() {
   const path = configPath();
   const settings = ((await readJsonFile(path)) ?? {}) as Partial<ConfigInput>;
   const paths = resolvePaths(path, settings.dataDir);
-  await prepareDirectories([dirname(paths.configPath), dirname(paths.modelsPath)]);
   const models = ((await readJsonFile(paths.modelsPath)) ?? {}) as ModelsConfig;
-  const providerId = settings.agent?.provider ?? "custom-api";
-  const provider = models.providers?.[providerId] ?? {};
-  // The wizard only reads model metadata; file-backed credentials would create auth.json before saving.
-  const runtime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: paths.modelsPath,
-    refreshOnCreate: false,
-  });
-  const error = runtime.getError();
-  if (error) throw new Error(error);
-  return { settings, paths, models, providerId, provider, runtime };
+  return { settings, paths, models };
 }
 
 async function askText(message: string, fallback?: string, validate = (value: string): true | string => value ? true : "此项不能为空。"): Promise<string> {
@@ -101,118 +57,254 @@ function validateTokenCount(value: string): true | string {
   return /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? true : "请输入 token 数量的正整数，例如 65536。";
 }
 
-async function askSecret(label: string, name: string, filePath: string): Promise<ConfigurationAnswers["secrets"][number]> {
-  if (process.env[name] || process.env[`${name}_FILE`]) {
-    await readSecret(name, true, filePath);
-    return { label, path: filePath, value: undefined, source: "使用环境变量" };
-  }
-  const exists = Boolean(await readSecret(name, false, filePath));
-  const value = await password({
-    message: `${label}${exists ? "（留空保留）" : ""}`,
+const selectTheme = { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } };
+
+function usesEnvironment(name: string): boolean {
+  return Boolean(process.env[name] || process.env[`${name}_FILE`]);
+}
+
+async function askPassword(message: string, existing = false, validate?: (value: string) => true | string): Promise<string> {
+  return (await password({
+    message: existing ? `${message}（留空保留）` : message,
     mask: "*",
     toggleMask: false,
-    validate: (answer) => answer.trim() || exists ? true : "此项不能为空。",
-  });
-  const secret = value.trim();
-  return { label, path: filePath, value: secret || undefined, source: secret ? "已输入新值" : "保留现有" };
+    validate: (answer) => {
+      const value = answer.trim();
+      if (!value) return existing || "此项不能为空。";
+      return validate?.(value) ?? true;
+    },
+  })).trim();
 }
 
-async function collectChannels(current: CurrentConfiguration, secrets: ConfigurationAnswers["secrets"]): Promise<
-  Pick<ConfigurationAnswers, "channels" | "weixinAccount">
-> {
-  const { settings, paths } = current;
-  stdout.write("\n━━━ 2/3 消息渠道 ━━━\n");
-  const selection = await select({
-    message: "选择要启用的渠道",
-    default: settings.weixin ? settings.telegram ? "both" : "weixin" : "telegram",
-    choices: [
-      { name: "微信", value: "weixin" },
-      { name: "Telegram", value: "telegram" },
-      { name: "微信和 Telegram", value: "both" },
-    ],
-    theme: { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } },
-  });
-  const disabled = [settings.telegram && selection === "weixin" ? "Telegram" : "", settings.weixin && selection === "telegram" ? "微信" : ""].filter(Boolean);
-  if (disabled.length) stdout.write(`保存后将停用${disabled.join("、")}，凭据和历史保留。\n`);
-  const channels: ConfigurationAnswers["channels"] = {};
-  if (selection !== "weixin") {
-    if (!settings.telegram) stdout.write("Bot Token 向 @BotFather 获取；数字用户 ID 向 @userinfobot 查询。\n");
-    secrets.push(await askSecret("Telegram Bot Token", "TELEGRAM_BOT_TOKEN", resolve(paths.secretsDir, "telegram-token")));
-    const userId = await askText("Telegram 用户 ID", settings.telegram?.allowedUserIds?.[0], (value) => /^\d+$/.test(value) ? true : "请输入你本人的数字用户 ID。");
-    channels.telegram = { ...settings.telegram, allowedUserIds: [userId, ...(settings.telegram?.allowedUserIds.slice(1) ?? [])] };
+function validateTelegramToken(token: string): true | string {
+  return /^\d+:[A-Za-z0-9_-]+$/.test(token) || "请粘贴完整的 Bot Token。";
+}
+
+async function telegramIdentity(token: string) {
+  const valid = validateTelegramToken(token);
+  if (valid !== true) {
+    stdout.write(`${valid}\n`);
+    return undefined;
   }
-  let weixinAccount: WeixinAccount | undefined;
-  if (selection !== "telegram") {
-    const path = resolve(paths.secretsDir, "weixin-account.json");
-    const saved = await readJsonFile(path);
-    let existing: WeixinAccount | undefined;
-    if (saved !== undefined) {
-      try { existing = parseWeixinAccount(saved); }
-      catch (error) {
-        stdout.write(`已有微信凭据无效，需要重新登录：${error instanceof Error ? error.message : String(error)}\n`);
+  try {
+    return await new Api(token, { timeoutSeconds: 15 }).getMe();
+  } catch (error) {
+    if (!(error instanceof GrammyError) || ![401, 404].includes(error.error_code)) throw error;
+    stdout.write(`Telegram 拒绝了 Bot Token（${error.error_code}），请检查后重试。\n`);
+    return undefined;
+  }
+}
+
+async function collectSecret(secrets: Map<string, string>, label: string, name: string, path: string): Promise<void> {
+  if (usesEnvironment(name)) {
+    await readSecret(name, true, path);
+    return;
+  }
+  const exists = secrets.has(path) || Boolean(await readSecret(name, false, path));
+  const value = await askPassword(label, exists);
+  if (value) secrets.set(path, value);
+}
+
+function accountName(account: ConfiguredAccount): string {
+  const name = account.label ?? account.botId ?? ("legacy" in account ? account.accountId : undefined) ?? "默认";
+  return `${account.channel === "weixin" ? "微信" : "Telegram"} · ${name}`;
+}
+
+async function askOwners(channel: ConfiguredAccount["channel"], existing?: string[]): Promise<string[]> {
+  const validId = channel === "telegram" ? /^\d+$/ : /^[^\s,]+$/;
+  const ids = (text: string) => text.split(",").map((id) => id.trim());
+  const value = await askText("授权用户 ID（逗号分隔）", existing?.join(", "),
+    (answer) => ids(answer).every((id) => validId.test(id))
+      || (channel === "telegram" ? "请输入数字用户 ID。" : "请输入 iLink 用户 ID。"));
+  return [...new Set(ids(value))];
+}
+
+async function collectAccounts(accounts: ConfiguredAccount[], paths: AppPaths, secrets: Map<string, string>, firstSetup = false): Promise<void> {
+  const credentialPath = (account: ConfiguredAccount) => accountCredentialPath(paths.secretsDir, account);
+  const savedWeixin = async (account: ConfiguredAccount) => {
+    const path = credentialPath(account);
+    const staged = secrets.get(path);
+    if (staged !== undefined) return parseWeixinAccount(JSON.parse(staged));
+    let value: unknown;
+    try {
+      value = await readJsonFile(path);
+    } catch (error) {
+      if (!(error instanceof Error) || !(error.cause instanceof SyntaxError)) throw error;
+      stdout.write(`${accountName(account)} 的凭据 JSON 无效。\n`);
+      return undefined;
+    }
+    if (value === undefined) return undefined;
+    try {
+      return parseWeixinAccount(value);
+    } catch (error) {
+      stdout.write(`${accountName(account)} 的凭据无效：${error instanceof Error ? error.message : String(error)}\n`);
+      return undefined;
+    }
+  };
+  const knownId = async (account: ConfiguredAccount): Promise<string | undefined> => {
+    if (account.botId) return account.botId;
+    if (account.channel === "weixin") return (await savedWeixin(account))?.ilink_bot_id;
+    // Legacy Telegram credentials include the bot's numeric ID before the colon.
+    const token = await readSecret("TELEGRAM_BOT_TOKEN", false, credentialPath(account));
+    return token?.match(/^(\d+):/)?.[1];
+  };
+  const checkDuplicate = async (channel: ConfiguredAccount["channel"], botId: string) => {
+    for (const account of accounts) {
+      if (account.channel === channel && await knownId(account) === botId) {
+        stdout.write(`该账号已添加：${accountName(account)}。\n`);
+        return true;
       }
     }
-    if (existing) stdout.write(`\n本地微信账号：${existing.ilink_bot_id}\n`);
-    const action = existing ? await select({
-      message: "微信登录",
-      default: "keep",
-      choices: [{ name: "使用已保存的凭据", value: "keep" }, { name: "重新扫码登录", value: "login" }],
-      theme: { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } },
-    }) : "login";
-    let userId: string | undefined;
-    let value: string | undefined;
-    if (action === "keep") {
-      weixinAccount = existing!;
-    } else {
-      const login = await loginWeixin(existing);
-      weixinAccount = login.account;
-      userId = login.userId;
-      if (!login.reused) value = `${JSON.stringify(login.account, null, 2)}\n`;
-    }
-    if (userId && settings.weixin && !settings.weixin.allowedUserIds.includes(userId)) {
-      stdout.write(`扫码用户 ${userId} 不在原授权列表中；如需使用，请加入下方列表。\n`);
-    }
-    if (!settings.weixin) stdout.write("使用 iLink 用户 ID，不是微信号；多个 ID 用逗号分隔。\n");
-    const allowed = await askText("微信授权用户", settings.weixin?.allowedUserIds.join(", ") ?? userId,
-      (answer) => answer.split(",").every((id) => id.trim() && !/\s/.test(id.trim())) || "请填写用户 ID，多个 ID 用逗号分隔。");
-    channels.weixin = { allowedUserIds: [...new Set(allowed.split(",").map((id) => id.trim()))] };
-    secrets.push({ label: "微信登录凭据", path, value, source: value ? "使用本次登录凭据" : "保留现有" });
-  }
-  return { channels, ...(weixinAccount ? { weixinAccount } : {}) };
-}
+    return false;
+  };
 
-function thinkingLevelLabel(level: ThinkingLevel): string {
-  return THINKING_LEVELS.find(([value]) => value === level)?.[1] ?? level;
+  const add = async () => {
+    const channel = await select<ConfiguredAccount["channel"] | "back">({
+      message: "选择渠道",
+      choices: [
+        { name: "微信", value: "weixin" },
+        { name: "Telegram", value: "telegram" },
+        ...(accounts.length ? [{ name: "返回", value: "back" as const }] : []),
+      ],
+      theme: selectTheme,
+    });
+    if (channel === "back") return;
+    if (channel === "weixin") {
+      const login = await loginWeixin();
+      if (!login) return;
+      const { account, userId } = login;
+      if (await checkDuplicate(channel, account.ilink_bot_id)) return;
+      if (!userId) stdout.write("请填写 iLink 用户 ID。\n");
+      const allowedUserIds = await askOwners(channel, userId ? [userId] : undefined);
+      const entry = { channel, botId: account.ilink_bot_id, allowedUserIds };
+      secrets.set(credentialPath(entry), `${JSON.stringify(account, null, 2)}\n`);
+      accounts.push(entry);
+      return;
+    }
+
+    const hasEnvToken = !accounts.some((account) => account.channel === "telegram") && usesEnvironment("TELEGRAM_BOT_TOKEN");
+    const envToken = hasEnvToken && await select({
+      message: "Bot Token 来源",
+      choices: [
+        { name: "使用环境变量", value: "env" },
+        { name: "输入新 Token", value: "manual" },
+      ],
+      default: "env",
+      theme: selectTheme,
+    }) === "env";
+    if (!envToken) stdout.write("Token 向 @BotFather 获取。\n");
+    const token = envToken ? await readSecret("TELEGRAM_BOT_TOKEN", true) : await askPassword("Bot Token", false, validateTelegramToken);
+    const bot = await telegramIdentity(token);
+    if (!bot) return;
+    const botId = String(bot.id);
+    if (await checkDuplicate(channel, botId)) return;
+    const label = `@${bot.username}`;
+    stdout.write(`Telegram · ${label}\n`);
+    const allowedUserIds = await askOwners(channel);
+    const entry = { channel, botId, label, allowedUserIds };
+    if (envToken) accounts.push({ ...entry, legacy: true });
+    else {
+      secrets.set(credentialPath(entry), token);
+      accounts.push(entry);
+    }
+  };
+
+  while (!accounts.length) await add();
+  while (true) {
+    const selected = await select<number>({
+      message: "消息账号",
+      default: -1,
+      choices: [
+        ...accounts.map((account, index) => ({
+          name: accountName(account) + (account.enabled === false ? "（已停用）" : ""), value: index,
+        })),
+        { name: "添加账号", value: -2 },
+        { name: firstSetup ? "确认保存" : "返回配置菜单", value: -1 },
+      ],
+      theme: selectTheme,
+    });
+    if (selected === -1) return;
+    if (selected === -2) {
+      await add();
+      continue;
+    }
+    const account = accounts[selected]!;
+    const action = await select({
+      message: accountName(account),
+      choices: [
+        { name: "授权用户", value: "owners" },
+        { name: "修改显示名称", value: "label" },
+        { name: account.channel === "weixin" ? "重新扫码" : "更新 Token", value: "credentials" },
+        { name: account.enabled === false ? "启用" : "停用", value: "toggle" },
+        { name: "返回", value: "back" },
+      ],
+      default: "back",
+      theme: selectTheme,
+    });
+    if (action === "owners") {
+      account.allowedUserIds = await askOwners(account.channel, account.allowedUserIds);
+    } else if (action === "label") {
+      account.label = await askText("显示名称", account.label ?? account.botId);
+    } else if (action === "toggle") {
+      if (account.enabled !== false && accounts.filter((item) => item.enabled !== false).length === 1) {
+        stdout.write("请至少保留一个启用的账号。\n");
+      } else if (account.enabled === false) delete account.enabled;
+      else account.enabled = false;
+    } else if (action === "credentials") {
+      if (account.channel === "telegram" && "legacy" in account && usesEnvironment("TELEGRAM_BOT_TOKEN")) {
+        stdout.write("请更新环境变量中的 Telegram Token。\n");
+        continue;
+      }
+      const existingWeixin = account.channel === "weixin" ? await savedWeixin(account) : undefined;
+      const botId = account.channel === "weixin" ? account.botId ?? existingWeixin?.ilink_bot_id : await knownId(account);
+      if (!botId) {
+        stdout.write("无法确认原 Bot 身份，请添加新账号。\n");
+        continue;
+      }
+      const path = credentialPath(account);
+      if (account.channel === "weixin") {
+        const login = await loginWeixin(existingWeixin);
+        if (!login) continue;
+        if (login.account.ilink_bot_id !== botId) {
+          stdout.write("扫到了另一个微信账号，请选择「添加账号」。\n");
+          continue;
+        }
+        if (!login.reused) secrets.set(path, `${JSON.stringify(login.account, null, 2)}\n`);
+      } else {
+        const token = await askPassword("新 Bot Token", false, validateTelegramToken);
+        const bot = await telegramIdentity(token);
+        if (!bot) continue;
+        if (String(bot.id) !== botId) {
+          stdout.write("Token 属于另一个 Bot，请选择「添加账号」。\n");
+          continue;
+        }
+        secrets.set(path, token);
+      }
+      account.botId = botId;
+    }
+  }
 }
 
 async function askThinkingLevel(reasoning: boolean, current?: ThinkingLevel): Promise<ThinkingLevel> {
   if (!reasoning) return "off";
   return select<ThinkingLevel>({
-    message: "思考强度（推理模型专用，影响响应速度和质量）",
+    message: "思考强度",
     default: current ?? "medium",
     choices: THINKING_LEVELS.map(([value, name]) => ({ 
       name: value === "medium" ? `${name}（推荐）` : name, 
       value 
     })),
-    theme: { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } },
+    theme: selectTheme,
   });
 }
 
-async function askModelParameters(current: Partial<ModelParameters>): Promise<ModelParameters> {
-  if (current.reasoning !== undefined && current.contextWindow !== undefined && current.maxTokens !== undefined) {
-    stdout.write(`模型参数：推理${current.reasoning ? "支持" : "不支持"}，上下文 ${current.contextWindow} token，最大输出 ${current.maxTokens} token。\n`);
-    if (!await confirm({ message: "修改模型参数？", default: false })) {
-      return { reasoning: current.reasoning, contextWindow: current.contextWindow, maxTokens: current.maxTokens };
-    }
-  }
-  stdout.write(
-    "模型参数说明：\n" +
-    "  • 上下文窗口：模型一次能看到多少 token（输入+输出总和，如 128000）\n" +
-    "  • 最大输出：单次回复最多生成多少 token（如 4096）\n"
-  );
-  const reasoning = await confirm({ message: "模型是否支持推理（reasoning / thinking）？", default: current.reasoning ?? false });
-  const contextWindow = Number(await askText("上下文窗口（token）", current.contextWindow?.toString(), validateTokenCount));
-  const maxTokens = Number(await askText("最大输出（token）", current.maxTokens?.toString(), validateTokenCount));
+async function askModelParameters(current: Partial<ModelParameters>, advanced: boolean): Promise<ModelParameters> {
+  const reasoning = !advanced && current.reasoning !== undefined ? current.reasoning
+    : await confirm({ message: "模型支持推理？", default: current.reasoning ?? false });
+  const contextWindow = !advanced && current.contextWindow !== undefined ? current.contextWindow
+    : Number(await askText("上下文窗口（token）", current.contextWindow?.toString(), validateTokenCount));
+  const maxTokens = !advanced && current.maxTokens !== undefined ? current.maxTokens
+    : Number(await askText("最大输出（token）", current.maxTokens?.toString(), validateTokenCount));
   return { reasoning, contextWindow, maxTokens };
 }
 
@@ -231,102 +323,124 @@ async function findModelDefaults(providerId: string, modelId: string) {
       value: model.provider,
       description: `上下文 ${model.contextWindow} token，最大输出 ${model.maxTokens} token`,
     })),
-    theme: { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } },
+    theme: selectTheme,
   });
   return matches.find((model) => model.provider === source);
 }
 
-async function collectConfiguration(current: CurrentConfiguration): Promise<ConfigurationAnswers> {
-  const { settings, paths, providerId, provider, runtime } = current;
-  stdout.write("\n━━━ 1/3 模型接入 ━━━\n");
-  if (!settings.agent) stdout.write("API 地址和协议请按服务商文档填写。\n");
-  const currentModel = settings.agent?.model ? runtime.getModel(providerId, settings.agent.model) : undefined;
-  const baseUrl = await askText("API 基础地址", currentModel?.baseUrl ?? provider.baseUrl ?? "https://api.openai.com/v1", validateBaseUrl);
-  const api = await select<ModelApi>({
-    message: "API 协议",
-    default: (currentModel?.api ?? provider.api) === "openai-completions" ? "openai-completions" : "openai-responses",
+async function modelRuntime(modelsPath: string): Promise<ModelRuntime> {
+  const runtime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(), modelsPath, refreshOnCreate: false,
+  });
+  const error = runtime.getError();
+  if (error) throw new Error(error);
+  return runtime;
+}
+
+async function collectModel(current: CurrentConfiguration, secrets: Map<string, string>, advanced = false): Promise<void> {
+  const { settings, paths, models } = current;
+  const providerId = settings.agent?.provider ?? "custom-api";
+  const provider = models.providers?.[providerId] ?? {};
+  const currentModel = settings.agent?.model
+    ? provider.models?.find((model) => model.id === settings.agent?.model) : undefined;
+  const catalogProvider = getBuiltinProviders().find((id) => id === providerId);
+  const catalogModel = catalogProvider && getBuiltinModels(catalogProvider).find((model) => model.id === settings.agent?.model);
+  const currentUrl = currentModel?.baseUrl ?? provider.baseUrl ?? catalogModel?.baseUrl ?? "https://api.openai.com/v1";
+  const currentApi = (currentModel?.api ?? provider.api ?? catalogModel?.api) === "openai-completions"
+    ? "openai-completions" : "openai-responses";
+
+  const baseUrl = advanced ? currentUrl : await askText("API 基础地址", currentUrl, validateBaseUrl);
+  const api = advanced ? currentApi : await select<ModelApi>({
+    message: "API 协议", default: currentApi,
     choices: [
       { name: "Responses（/responses）", value: "openai-responses" },
       { name: "Chat Completions（/chat/completions）", value: "openai-completions" },
     ],
-    theme: { style: { keysHelpTip: () => "↑↓ 选择，回车确认" } },
+    theme: selectTheme,
   });
-  const modelId = await askText("模型 ID", settings.agent?.model);
+  const modelId = advanced ? settings.agent!.model : await askText("模型 ID", settings.agent?.model);
   const existingModel = provider.models?.find((entry) => entry.id === modelId) ?? { id: modelId };
-  const builtin = await findModelDefaults(providerId, modelId);
-  const parameters = await askModelParameters({ ...builtin, ...existingModel, ...provider.modelOverrides?.[modelId] });
-  const thinkingLevel = await askThinkingLevel(parameters.reasoning, settings.agent?.thinkingLevel);
+  const modelOverride = provider.modelOverrides?.[modelId];
+  const known = { ...existingModel, ...modelOverride };
+  const needsDefaults = known.reasoning === undefined || known.contextWindow === undefined || known.maxTokens === undefined
+    || existingModel.input === undefined || existingModel.thinkingLevelMap === undefined;
+  const builtin = needsDefaults ? await findModelDefaults(providerId, modelId) : undefined;
+  const parameters = await askModelParameters({ ...builtin, ...existingModel, ...modelOverride }, advanced);
+  const thinkingLevel = advanced ? await askThinkingLevel(parameters.reasoning, settings.agent?.thinkingLevel)
+    : parameters.reasoning ? settings.agent?.thinkingLevel ?? "medium" : "off";
   const model = {
     ...existingModel,
-    ...(existingModel.api === undefined ? {} : { api }),
-    ...(existingModel.baseUrl === undefined ? {} : { baseUrl }),
+    ...(advanced || existingModel.api === undefined ? {} : { api }),
+    ...(advanced || existingModel.baseUrl === undefined ? {} : { baseUrl }),
     input: existingModel.input ?? builtin?.input ?? ["text"],
     ...(existingModel.thinkingLevelMap === undefined && builtin?.thinkingLevelMap ? { thinkingLevelMap: builtin.thinkingLevelMap } : {}),
   };
-  const modelKeyPath = resolve(paths.secretsDir, "model-api-key");
-  const secrets = [await askSecret("模型 API Key", "PRAX_MODEL_API_KEY", modelKeyPath)];
-  const channels = await collectChannels(current, secrets);
-
-  stdout.write("\n━━━ 3/3 网页搜索 ━━━\n此选项不影响网页抓取。\n");
-  const webSearchEnabled = await confirm({ message: "启用网页搜索（需要 Tavily Key）？", default: settings.webSearch?.enabled ?? false });
-  if (webSearchEnabled) {
-    const tavilyKeyPath = resolve(paths.secretsDir, "tavily-api-key");
-    secrets.push(await askSecret("Tavily API Key", "TAVILY_API_KEY", tavilyKeyPath));
-  }
-  return { baseUrl, api, model, parameters, thinkingLevel, ...channels, webSearchEnabled, secrets };
-}
-
-function buildConfiguration(current: CurrentConfiguration, answers: ConfigurationAnswers): { settings: ConfigInput; models: ModelsConfig } {
-  const { settings, paths, models, providerId, provider } = current;
-  const { telegram: _telegram, weixin: _weixin, ...otherSettings } = settings;
-  const updatedSettings = {
-    ...otherSettings,
-    dataDir: (settings.dataDir ?? relative(dirname(paths.configPath), paths.dataDir)) || ".",
-    agent: { ...settings.agent, provider: providerId, model: answers.model.id, thinkingLevel: answers.thinkingLevel },
-    ...answers.channels,
-    webSearch: { ...settings.webSearch, enabled: answers.webSearchEnabled },
-  };
-  const override = provider.modelOverrides?.[answers.model.id];
-  const updatedOverride: Record<string, unknown> = { ...override };
-  const parameters: Partial<ModelParameters> = { ...answers.parameters };
+  if (!advanced) await collectSecret(secrets, "模型 API Key", "PRAX_MODEL_API_KEY", resolve(paths.secretsDir, "model-api-key"));
+  settings.agent = { ...settings.agent, provider: providerId, model: modelId, thinkingLevel };
+  const updatedOverride: Record<string, unknown> = { ...modelOverride };
+  const modelParameters: Partial<ModelParameters> = { ...parameters };
   for (const key of ["reasoning", "contextWindow", "maxTokens"] as const) {
-    if (override?.[key] !== undefined) {
-      updatedOverride[key] = answers.parameters[key];
-      delete parameters[key];
+    if (modelOverride?.[key] !== undefined) {
+      updatedOverride[key] = parameters[key];
+      delete modelParameters[key];
     }
   }
-  const model = { ...answers.model, ...parameters };
+  const definition = { ...model, ...modelParameters };
   const modelEntries = [...(provider.models ?? [])];
-  const modelIndex = modelEntries.findIndex((entry) => entry.id === answers.model.id);
-  if (modelIndex < 0) modelEntries.push(model);
-  else modelEntries[modelIndex] = model;
-  return {
-    settings: updatedSettings,
-    models: {
-      ...models,
-      providers: {
-        ...models.providers,
-        [providerId]: {
-          ...provider,
-          ...(answers.model.baseUrl === undefined ? { baseUrl: answers.baseUrl } : {}),
-          ...(answers.model.api === undefined ? { api: answers.api } : {}),
-          ...(override ? { modelOverrides: { ...provider.modelOverrides, [answers.model.id]: updatedOverride } } : {}),
-          models: modelEntries,
-        },
-      },
+  const modelIndex = modelEntries.findIndex((entry) => entry.id === modelId);
+  if (modelIndex < 0) modelEntries.push(definition);
+  else modelEntries[modelIndex] = definition;
+  models.providers = {
+    ...models.providers,
+    [providerId]: {
+      ...provider,
+      ...(!advanced && model.baseUrl === undefined ? { baseUrl } : {}),
+      ...(!advanced && model.api === undefined ? { api } : {}),
+      ...(modelOverride ? { modelOverrides: { ...provider.modelOverrides, [modelId]: updatedOverride } } : {}),
+      models: modelEntries,
     },
   };
 }
 
-async function saveConfiguration(paths: AppPaths, updated: ReturnType<typeof buildConfiguration>, secrets: ConfigurationAnswers["secrets"]): Promise<void> {
-  parseConfig(updated.settings, paths.configPath);
-  const secretsToWrite = secrets.flatMap(({ path, value }) => value === undefined ? [] : [{ path, value }]);
-  await prepareDirectories(secretsToWrite.map(({ path }) => dirname(path)));
-  await Promise.all([
-    atomicWrite(paths.configPath, `${JSON.stringify(updated.settings, null, 2)}\n`),
-    atomicWrite(paths.modelsPath, `${JSON.stringify(updated.models, null, 2)}\n`),
-    ...secretsToWrite.map(({ path, value }) => atomicWrite(path, value)),
-  ]);
+function setAccounts(settings: Partial<ConfigInput>, accounts: ConfiguredAccount[]): void {
+  delete settings.accounts;
+  delete settings.weixin;
+  delete settings.telegram;
+  for (const account of accounts) {
+    if (!("legacy" in account)) {
+      (settings.accounts ??= []).push(account);
+    } else {
+      const { channel, legacy: _legacy, ...entry } = account;
+      settings[channel] = entry;
+    }
+  }
+}
+
+async function saveConfiguration(paths: AppPaths, settings: ConfigInput, models: string | undefined, secrets: Map<string, string>): Promise<void> {
+  const config = parseConfig(settings, paths.configPath);
+  const files = new Map(secrets);
+  if (models !== undefined) files.set(paths.modelsPath, models);
+  files.set(paths.configPath, `${JSON.stringify(settings, null, 2)}\n`);
+
+  const staged = new Map<string, string>();
+  try {
+    for (const [path, content] of files) {
+      const directory = dirname(path);
+      await mkdir(directory, { recursive: true });
+      const temporary = await mkdtemp(resolve(directory, ".prax-config-"));
+      const file = resolve(temporary, "new");
+      staged.set(path, file);
+      await writeFile(file, content, { mode: 0o600 });
+    }
+    const runtime = await modelRuntime(staged.get(paths.modelsPath) ?? paths.modelsPath);
+    if (!runtime.getModel(config.agent.provider, config.agent.model)) {
+      throw new Error(`找不到模型 ${config.agent.provider}/${config.agent.model}。`);
+    }
+    // Publish config last so it only points to files that were written successfully.
+    for (const [path, file] of staged) await rename(file, path);
+  } finally {
+    await Promise.all(Array.from(staged.values(), (file) => rm(dirname(file), { recursive: true })));
+  }
 }
 
 export async function configure(): Promise<void> {
@@ -338,52 +452,81 @@ export async function configure(): Promise<void> {
     );
   }
   const current = await readConfiguration();
-  stdout.write("\nPrax 配置\n回车保留默认值，Ctrl+C 取消。\n");
-  let answers: ConfigurationAnswers;
-  let updated: ReturnType<typeof buildConfiguration>;
+  const { settings, paths, models } = current;
+  const original = structuredClone(settings);
+  const originalModels = JSON.stringify(models);
+  const previous = configuredAccounts(original);
+  const accounts = structuredClone(previous);
+  const secrets = new Map<string, string>();
+  stdout.write("\nPrax 配置（Ctrl+C 取消）\n");
   try {
-    answers = await collectConfiguration(current);
-    updated = buildConfiguration(current, answers);
-    stdout.write(
-      "\n━━━ 配置摘要 ━━━\n" +
-      `API：${answers.baseUrl}\n` +
-      `协议：${answers.api === "openai-responses" ? "Responses" : "Chat Completions"}\n` +
-      `模型：${answers.model.id}\n` +
-      `上下文：${answers.parameters.contextWindow} token；最大输出：${answers.parameters.maxTokens} token\n` +
-      (answers.parameters.reasoning ? `思考强度：${thinkingLevelLabel(answers.thinkingLevel)}\n` : "") +
-      `渠道：${[answers.channels.weixin ? "微信" : "", answers.channels.telegram ? "Telegram" : ""].filter(Boolean).join("、")}\n` +
-      (answers.channels.weixin ? `微信账号：${answers.weixinAccount!.ilink_bot_id}\n微信授权用户：${answers.channels.weixin.allowedUserIds.join(", ")}\n` : "") +
-      (answers.channels.telegram?.accountId && answers.channels.telegram.accountId !== "default" ? `Telegram 账号标识：${answers.channels.telegram.accountId}\n` : "") +
-      (answers.channels.telegram ? `Telegram 用户：${answers.channels.telegram.allowedUserIds.join(", ")}\n` : "") +
-      `网页搜索：${answers.webSearchEnabled ? "开启" : "关闭"}；网页抓取：${updated.settings.webFetch?.enabled === false ? "关闭" : "开启"}\n` +
-      answers.secrets.filter(({ source }) => source !== "保留现有").map(({ label, source }) => `${label}：${source}\n`).join("")
-    );
-    if (!await confirm({ message: "保存以上配置？", default: true })) {
+    if (!settings.agent) {
+      stdout.write("模型接入\n");
+      settings.dataDir ??= relative(dirname(paths.configPath), paths.dataDir) || ".";
+      await collectModel(current, secrets);
+      await collectAccounts(accounts, paths, secrets, true);
+    } else {
+      while (true) {
+        const section = await select({
+          message: "配置项目",
+          choices: [
+            { name: "消息账号", value: "accounts" },
+            { name: "模型接入", value: "model" },
+            { name: "模型高级设置", value: "advanced" },
+            { name: "网页搜索", value: "search" },
+            { name: "保存并退出", value: "save" },
+          ],
+          default: "save",
+          theme: selectTheme,
+        });
+        if (section === "save") break;
+        if (section === "accounts") await collectAccounts(accounts, paths, secrets);
+        if (section === "model" || section === "advanced") await collectModel(current, secrets, section === "advanced");
+        if (section === "search") {
+          const enabled = await confirm({ message: "启用网页搜索？", default: settings.webSearch?.enabled ?? false });
+          settings.webSearch = { ...settings.webSearch, enabled };
+          const path = resolve(paths.secretsDir, "tavily-api-key");
+          if (enabled) await collectSecret(secrets, "Tavily API Key", "TAVILY_API_KEY", path);
+          else secrets.delete(path);
+        }
+      }
+    }
+    setAccounts(settings, accounts);
+    const modelChanged = JSON.stringify(models) !== originalModels;
+    const summary: string[] = [];
+    if (modelChanged || JSON.stringify(settings.agent) !== JSON.stringify(original.agent)
+      || secrets.has(resolve(paths.secretsDir, "model-api-key"))) {
+      summary.push(`模型 · ${settings.agent!.model}`);
+    }
+    for (const [index, account] of accounts.entries()) {
+      const before = previous[index];
+      const updated = secrets.has(accountCredentialPath(paths.secretsDir, account));
+      const owners = before?.allowedUserIds.join(", ") === account.allowedUserIds.join(", ") ? ""
+        : `（授权：${account.allowedUserIds.join(", ")}）`;
+      if (!before) summary.push(`新增 ${accountName(account)}${owners}`);
+      else if (JSON.stringify(before) !== JSON.stringify(account) || updated) {
+        const action = before.enabled !== account.enabled ? account.enabled === false ? "停用" : "启用" : "更新";
+        summary.push(`${action} ${accountName(account)}${owners}`);
+      }
+    }
+    if (settings.webSearch?.enabled !== original.webSearch?.enabled || secrets.has(resolve(paths.secretsDir, "tavily-api-key"))) {
+      summary.push(`网页搜索 · ${settings.webSearch?.enabled ? "开启" : "关闭"}`);
+    }
+    if (!summary.length) {
+      stdout.write("配置未变更。\n");
+      return;
+    }
+    stdout.write(`\n本次变更\n${summary.join("\n")}\n`);
+    if (!await confirm({ message: "保存配置？", default: true })) {
       stdout.write("已取消，配置未保存。\n");
       return;
     }
+    await saveConfiguration(paths, settings as ConfigInput, modelChanged ? `${JSON.stringify(models, null, 2)}\n` : undefined, secrets);
   } catch (error) {
     if (!(error instanceof Error) || error.name !== "ExitPromptError") throw error;
     stdout.write("\n已取消，配置未保存。\n");
     process.exitCode = 130;
     return;
   }
-  await saveConfiguration(current.paths, updated, answers.secrets);
-  stdout.write(`\n已保存：${current.paths.configPath}\n`);
-
-  // 验证配置
-  try {
-    await loadConfig(current.paths.configPath);
-    await createModelRuntime(current.paths);
-    stdout.write("✓ 本地检查通过；渠道收发和模型回复尚待验证。\n");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    stdout.write(`⚠ 配置已保存，但本地检查失败：${message}\n`);
-    process.exitCode = 1;
-    return;
-  }
-
-  stdout.write("\n本地：npm run dev（已运行则重启）\n");
-  stdout.write("Docker 宿主机：docker compose up -d；已运行则 docker compose restart prax\n");
-  stdout.write("启动后发送 /status 检查渠道，再发送文字测试模型。\n");
+  stdout.write("已保存。启动或重启 Prax 后，向各 Bot 发送 /status 测试。\n");
 }
